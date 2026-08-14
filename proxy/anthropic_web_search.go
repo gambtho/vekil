@@ -129,6 +129,15 @@ type webSearchMediation struct {
 	// delegatedUsage accumulates internal Responses spend across the turn so
 	// Task 12 can flush it additively instead of clobbering the turn's usage.
 	delegatedUsage responsesUsage
+	// extraHeaders and publicModel are the client headers and public model used
+	// for every mediated dispatch of this turn.
+	extraHeaders http.Header
+	publicModel  string
+	// delegatedCalls and continuationUsage are loop-owned counters: the number
+	// of searches actually delegated, and the token usage of every mediated turn
+	// except the final one whose usage is emitted directly.
+	delegatedCalls    int
+	continuationUsage models.AnthropicUsage
 }
 
 // webSearchMediationFor decides whether this request is eligible for
@@ -666,4 +675,207 @@ func webSearchHostMatchesAny(host string, domains []string) bool {
 		}
 	}
 	return false
+}
+
+// runWebSearchLoop drives bounded mediated turns against one pinned route
+// target. ctx must already carry the route operation for the client's turn.
+// Every dispatch, turn 1 included, is tagged routeAttemptWebSearch so a failure
+// can still fall back through the untouched client budget.
+func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *webSearchMediation) (*models.AnthropicResponse, error) {
+	if m == nil {
+		return nil, fmt.Errorf("web search mediation is required")
+	}
+	operation := routeOperationFromContext(ctx)
+	// One send per possible search, plus the opening turn and the turn that
+	// consumes the last result set.
+	operation.grantWebSearchSends(m.maxSearches + 2)
+	dispatchCtx := withRouteAttemptKind(ctx, routeAttemptWebSearch)
+
+	var (
+		blocks    []models.ContentBlock
+		pending   *models.AnthropicResponse
+		delegated int
+		remaining = m.maxSearches
+		turn      int
+		override  string
+	)
+	for {
+		// The executor soft-pins the target on first success, so from turn 2 on
+		// every mediated dispatch must already be bound to one target. A missing
+		// pin would mean the loop could silently fail over mid-conversation.
+		if turn > 0 && operation != nil && operation.pinnedTarget() == "" {
+			return nil, fmt.Errorf("web search continuation has no pinned route target")
+		}
+		resp, err := h.executeAnthropicMessagesRouteRequest(dispatchCtx, body, m.extraHeaders, false, m.publicModel)
+		if err != nil {
+			return nil, err
+		}
+		message, err := readMediatedAnthropicMessage(resp)
+		if err != nil {
+			return nil, err
+		}
+		if pending != nil {
+			addAnthropicUsage(&m.continuationUsage, pending.Usage)
+		}
+		pending = message
+		turn++
+
+		searched := false
+		exhausted := false
+		clientToolUse := false
+		toolResults := make([]json.RawMessage, 0, len(message.Content))
+		for _, block := range message.Content {
+			if block.Type != "tool_use" || block.Name != anthropicWebSearchToolName {
+				if block.Type == "tool_use" {
+					clientToolUse = true
+				}
+				blocks = append(blocks, block)
+				continue
+			}
+			searched = true
+			callID := newWebSearchCallID()
+			query := webSearchQueryFromInput(block.Input)
+			if remaining <= 0 {
+				use, _ := synthesizeWebSearchBlocks(callID, query, nil)
+				blocks = append(blocks, use, webSearchErrorResultBlock(callID, "max_uses_exceeded"))
+				toolResults = append(toolResults, upstreamToolResultJSON(block.ID, "web search budget exhausted", true))
+				exhausted = true
+				continue
+			}
+			results, err := h.delegateWebSearch(ctx, m, query)
+			if err != nil {
+				return nil, err
+			}
+			remaining--
+			delegated++
+			use, result := synthesizeWebSearchBlocks(callID, query, results)
+			blocks = append(blocks, use, result)
+			toolResults = append(toolResults, upstreamToolResultJSON(block.ID, webSearchResultsText(results), false))
+		}
+
+		if !searched {
+			break
+		}
+		if clientToolUse {
+			override = "tool_use"
+			break
+		}
+		if exhausted {
+			override = "end_turn"
+			break
+		}
+		body, err = appendWebSearchContinuationTurn(body, message.Content, toolResults)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	final := *pending
+	final.Content = blocks
+	if override != "" {
+		stop := override
+		final.StopReason = &stop
+	}
+	final.Usage = pending.Usage
+	final.Usage.ServerToolUse = &models.AnthropicServerToolUse{WebSearchRequests: delegated}
+	m.delegatedCalls = delegated
+	return &final, nil
+}
+
+func readMediatedAnthropicMessage(resp *http.Response) (*models.AnthropicResponse, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("upstream response is unavailable")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLargeRequestBodySize))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("mediated web search turn returned status %d", resp.StatusCode)
+	}
+	var message models.AnthropicResponse
+	if err := json.Unmarshal(body, &message); err != nil {
+		return nil, fmt.Errorf("decoding mediated web search turn: %w", err)
+	}
+	return &message, nil
+}
+
+func addAnthropicUsage(dst *models.AnthropicUsage, src models.AnthropicUsage) {
+	dst.InputTokens += src.InputTokens
+	dst.OutputTokens += src.OutputTokens
+	dst.CacheReadInputTokens += src.CacheReadInputTokens
+	dst.CacheCreationInputTokens += src.CacheCreationInputTokens
+}
+
+func webSearchQueryFromInput(input json.RawMessage) string {
+	var parsed struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(input, &parsed); err != nil {
+		return ""
+	}
+	return parsed.Query
+}
+
+func webSearchResultsText(results []webSearchResult) string {
+	if len(results) == 0 {
+		return "No results."
+	}
+	var b strings.Builder
+	for i, result := range results {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "%s\n%s\n%s", result.Title, result.URL, result.Snippet)
+	}
+	return b.String()
+}
+
+// upstreamToolResultJSON builds the tool_result the upstream sees. It answers
+// the upstream's own tool_use ID; the srvtoolu_ IDs are client-facing only.
+func upstreamToolResultJSON(toolUseID, text string, isError bool) json.RawMessage {
+	encoded, _ := json.Marshal(map[string]any{
+		"type":        "tool_result",
+		"tool_use_id": toolUseID,
+		"is_error":    isError,
+		"content":     []any{map[string]any{"type": "text", "text": text}},
+	})
+	return encoded
+}
+
+func appendWebSearchContinuationTurn(body []byte, assistant []models.ContentBlock, toolResults []json.RawMessage) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	var messages []json.RawMessage
+	if raw, ok := fields["messages"]; ok {
+		if err := json.Unmarshal(raw, &messages); err != nil {
+			return nil, err
+		}
+	}
+	assistantContent, err := json.Marshal(assistant)
+	if err != nil {
+		return nil, err
+	}
+	assistantTurn, err := json.Marshal(models.AnthropicMessage{Role: "assistant", Content: assistantContent})
+	if err != nil {
+		return nil, err
+	}
+	resultContent, err := json.Marshal(toolResults)
+	if err != nil {
+		return nil, err
+	}
+	userTurn, err := json.Marshal(models.AnthropicMessage{Role: "user", Content: resultContent})
+	if err != nil {
+		return nil, err
+	}
+	messages = append(messages, assistantTurn, userTurn)
+	encoded, err := json.Marshal(messages)
+	if err != nil {
+		return nil, err
+	}
+	fields["messages"] = encoded
+	return json.Marshal(fields)
 }
