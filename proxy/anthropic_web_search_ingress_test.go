@@ -149,6 +149,18 @@ func TestHandleAnthropicMessagesWebSearchHappyPathEmitsSynthesizedBlocks(t *test
 	if got := rec.Header().Get("Content-Type"); got != "application/json" {
 		t.Fatalf("Content-Type got = %q, want = %q", got, "application/json")
 	}
+	// A mediated turn must not silently drop the passthrough headers the direct
+	// path preserves; anthropic-ratelimit-* is what clients back off on. "1" is
+	// the SECOND (final) upstream turn's value, so this also pins that the
+	// emitted turn's own headers win.
+	if got := rec.Header().Get("Anthropic-Ratelimit-Requests-Remaining"); got != "1" {
+		t.Fatalf("anthropic-ratelimit-requests-remaining: got=%q, want=%q", got, "1")
+	}
+	// The body is re-marshaled, so the upstream turn's Content-Length must not
+	// be forwarded.
+	if got := rec.Header().Get("Content-Length"); got != "" {
+		t.Fatalf("Content-Length: got=%q, want=%q", got, "")
+	}
 	// The upstream never saw the hosted tool; it saw the client stand-in.
 	if bytes.Contains(fake.messageBodies[0], []byte("web_search_20250305")) {
 		t.Fatalf("mediated dispatch forwarded the hosted tool: got = %s", fake.messageBodies[0])

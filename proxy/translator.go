@@ -70,9 +70,9 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	oaiReq.Messages = mergeSplitAnthropicReplayAssistantTurns(oaiReq.Messages)
 
 	// Tools. Anthropic's hosted server tools (web_search_*, web_fetch_*, bash_*,
-	// …) are executed by Anthropic's own infrastructure, not by the client, and
-	// have no Chat Completions equivalent. Translating one would emit a function
-	// tool with no parameters that nothing can ever answer, so reject it with an
+	// …) are declared by type alone and carry no input schema — whether Anthropic
+	// runs them or the client does. Translating one would emit a function tool
+	// with no parameters that nothing can ever answer, so reject it with an
 	// index the caller can act on instead. Callers that have a meaningful
 	// stand-in — the count_tokens probe — substitute before calling in.
 	for index, t := range req.Tools {

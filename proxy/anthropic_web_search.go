@@ -94,6 +94,11 @@ func (h *ProxyHandler) forwardAnthropicMessagesWebSearch(w http.ResponseWriter, 
 
 	// Past this point the turn is committed downstream and fallback is forbidden.
 	markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
+	// Match the direct path (writeDirectAnthropicJSONResponse) and hand the client
+	// the upstream's passthrough headers. The body is always re-marshaled here, so
+	// the upstream Content-Length never applies; the SSE branch resets
+	// Content-Type itself via setSSEHeaders.
+	copyMediatedWebSearchPassthroughHeaders(w, m.finalHeaders)
 	if req.Stream {
 		if err := writeAnthropicMessageAsSSE(w, message); err != nil {
 			h.log.Error("web search SSE replay failed",
@@ -114,6 +119,18 @@ func (h *ProxyHandler) forwardAnthropicMessagesWebSearch(w http.ResponseWriter, 
 		)
 	}
 	return true
+}
+
+// copyMediatedWebSearchPassthroughHeaders mirrors the direct path's header
+// handling for a mediated turn. Content-Length is always dropped because the
+// emitted body is re-marshaled from decoded blocks and never matches the
+// upstream turn's length.
+func copyMediatedWebSearchPassthroughHeaders(w http.ResponseWriter, upstream http.Header) {
+	if w == nil || len(upstream) == 0 {
+		return
+	}
+	copyPassthroughHeaders(w.Header(), upstream)
+	w.Header().Del("Content-Length")
 }
 
 // flushWebSearchInternalUsage books non-final loop turns and delegated /responses
@@ -253,6 +270,11 @@ type webSearchMediation struct {
 	// except the final one whose usage is emitted directly.
 	delegatedCalls    int
 	continuationUsage models.AnthropicUsage
+	// finalHeaders are the upstream response headers of the turn whose message is
+	// emitted to the client. The mediated success path copies them so passthrough
+	// headers the direct path preserves — anthropic-ratelimit-* above all — are
+	// not lost just because the turn was mediated.
+	finalHeaders http.Header
 }
 
 // webSearchMediationFor decides whether this request is eligible for
@@ -847,10 +869,13 @@ func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *web
 		if operation == nil {
 			m.summary.RecordUpstreamSend()
 		}
-		message, err := readMediatedAnthropicMessage(resp)
+		message, header, err := readMediatedAnthropicMessage(resp)
 		if err != nil {
 			return nil, err
 		}
+		// Only the last turn's headers survive: that is the turn whose message the
+		// client actually receives, and its rate-limit counters are the freshest.
+		m.finalHeaders = header
 		if pending != nil {
 			addAnthropicUsage(&m.continuationUsage, pending.Usage)
 		}
@@ -921,23 +946,27 @@ func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *web
 	return &final, nil
 }
 
-func readMediatedAnthropicMessage(resp *http.Response) (*models.AnthropicResponse, error) {
+// readMediatedAnthropicMessage decodes one mediated turn and returns the
+// upstream response headers alongside it, so the emitted turn can carry the
+// same passthrough headers (anthropic-ratelimit-* in particular) that
+// writeDirectAnthropicJSONResponse preserves on the direct path.
+func readMediatedAnthropicMessage(resp *http.Response) (*models.AnthropicResponse, http.Header, error) {
 	if resp == nil || resp.Body == nil {
-		return nil, fmt.Errorf("upstream response is unavailable")
+		return nil, nil, fmt.Errorf("upstream response is unavailable")
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLargeRequestBodySize))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("mediated web search turn returned status %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("mediated web search turn returned status %d", resp.StatusCode)
 	}
 	var message models.AnthropicResponse
 	if err := json.Unmarshal(body, &message); err != nil {
-		return nil, fmt.Errorf("decoding mediated web search turn: %w", err)
+		return nil, nil, fmt.Errorf("decoding mediated web search turn: %w", err)
 	}
-	return &message, nil
+	return &message, resp.Header, nil
 }
 
 func addAnthropicUsage(dst *models.AnthropicUsage, src models.AnthropicUsage) {
@@ -1059,6 +1088,33 @@ func decodeReplayedWebSearchBlocks(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &messages); err != nil {
 		return nil, err
 	}
+	merged, changed, err := decodeReplayedWebSearchMessages(messages)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	fields["messages"] = encoded
+	return json.Marshal(fields)
+}
+
+// decodeReplayedWebSearchMessages performs the message-level rewrite described
+// on decodeReplayedWebSearchBlocks. It is factored out so callers that already
+// hold decoded messages rather than a raw body — the /v1/messages/count_tokens
+// probe, which must translate a mediated history through translator.go — reuse
+// this one authoritative, fail-closed decoder instead of duplicating it.
+//
+// The returned slice is the input slice itself whenever nothing needed
+// converting, so a non-mediated history is never re-encoded.
+func decodeReplayedWebSearchMessages(messages []models.AnthropicMessage) ([]models.AnthropicMessage, bool, error) {
+	if !anthropicMessagesCarryReplayedWebSearchBlocks(messages) {
+		return messages, false, nil
+	}
 
 	rewritten := make([]models.AnthropicMessage, 0, len(messages)+2)
 	changed := false
@@ -1100,7 +1156,7 @@ func decodeReplayedWebSearchBlocks(body []byte) ([]byte, error) {
 			changed = true
 			keptContent, err := json.Marshal(kept)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: keptContent})
 			continue
@@ -1137,37 +1193,47 @@ func decodeReplayedWebSearchBlocks(body []byte) ([]byte, error) {
 		if len(pre) > 0 {
 			preContent, err := json.Marshal(pre)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: preContent})
 		}
 		resultContent, err := json.Marshal(results)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		rewritten = append(rewritten, models.AnthropicMessage{Role: "user", Content: resultContent})
 		if len(post) > 0 {
 			postContent, err := json.Marshal(post)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: postContent})
 		}
 	}
 	if !changed {
-		return body, nil
+		return messages, false, nil
 	}
 
 	merged, err := avoidAdjacentSameRoleAnthropicMessages(rewritten)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	encoded, err := json.Marshal(merged)
-	if err != nil {
-		return nil, err
+	return merged, true, nil
+}
+
+// anthropicMessagesCarryReplayedWebSearchBlocks is the cheap pre-check that
+// keeps the decoder a true no-op for ordinary histories: it scans the raw
+// content bytes instead of unmarshalling every message. A false positive (the
+// literal appearing inside plain text) only costs the decode pass, which then
+// changes nothing.
+func anthropicMessagesCarryReplayedWebSearchBlocks(messages []models.AnthropicMessage) bool {
+	for _, message := range messages {
+		if bytes.Contains(message.Content, []byte("server_tool_use")) ||
+			bytes.Contains(message.Content, []byte("web_search_tool_result")) {
+			return true
+		}
 	}
-	fields["messages"] = encoded
-	return json.Marshal(fields)
+	return false
 }
 
 // avoidAdjacentSameRoleAnthropicMessages merges any two adjacent messages that

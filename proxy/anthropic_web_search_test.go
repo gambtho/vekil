@@ -1175,3 +1175,79 @@ func TestWebSearchErrorResultBlockIsSingleObject(t *testing.T) {
 		t.Fatalf("error content = %s", block.Content)
 	}
 }
+
+// TestHandleAnthropicCountTokensDecodesReplayedWebSearchBlocks pins the fix for
+// the "next count_tokens after a mediated search 400s" defect: Copilot models
+// take the TRANSLATED count_tokens path, and translator.go rejects unknown
+// content block types, so a history carrying Vekil-synthesized server_tool_use /
+// web_search_tool_result blocks must be decoded before the probe translation.
+// The handler here has web_search DISABLED, which is exactly the point: a
+// history can carry blocks synthesized while the feature was on in an earlier
+// session, so the decode must not be gated on the flag.
+func TestHandleAnthropicCountTokensDecodesReplayedWebSearchBlocks(t *testing.T) {
+	t.Parallel()
+
+	encoded := encodeWebSearchContent(webSearchResult{
+		URL: "https://example.com/a", Title: "Alpha", Snippet: "alpha is a letter", PageAge: "1 day",
+	})
+
+	handler := newTestProxyHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		var oaiReq models.OpenAIRequest
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &oaiReq); err != nil {
+			t.Errorf("parse upstream request: %v", err)
+			return
+		}
+		wantRoles := []string{"user", "assistant", "tool", "assistant", "user"}
+		gotRoles := make([]string, 0, len(oaiReq.Messages))
+		for _, message := range oaiReq.Messages {
+			gotRoles = append(gotRoles, message.Role)
+		}
+		if strings.Join(gotRoles, ",") != strings.Join(wantRoles, ",") {
+			t.Errorf("upstream message roles: got=%v, want=%v", gotRoles, wantRoles)
+		} else {
+			if len(oaiReq.Messages[1].ToolCalls) != 1 {
+				t.Errorf("assistant tool_calls: got=%d, want=1", len(oaiReq.Messages[1].ToolCalls))
+			} else if name := oaiReq.Messages[1].ToolCalls[0].Function.Name; name != "web_search" {
+				t.Errorf("tool_calls[0].function.name: got=%q, want=%q", name, "web_search")
+			}
+			if id := oaiReq.Messages[2].ToolCallID; id != "srvtoolu_AAAAAAAAAAAAAAAAAAAAAA" {
+				t.Errorf("tool message tool_call_id: got=%q, want=%q", id, "srvtoolu_AAAAAAAAAAAAAAAAAAAAAA")
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-count","object":"chat.completion","created":1,` +
+			`"model":"claude-sonnet-4","choices":[{"index":0,"message":{"role":"assistant","content":"x"},` +
+			`"finish_reason":"length"}],"usage":{"prompt_tokens":222,"completion_tokens":1,"total_tokens":223}}`))
+	})
+
+	body := `{
+		"model": "claude-sonnet-4",
+		"messages": [
+			{"role": "user", "content": "what is alpha"},
+			{"role": "assistant", "content": [
+				{"type":"server_tool_use","id":"srvtoolu_AAAAAAAAAAAAAAAAAAAAAA","name":"web_search","input":{"query":"alpha"}},
+				{"type":"web_search_tool_result","tool_use_id":"srvtoolu_AAAAAAAAAAAAAAAAAAAAAA","content":[{"type":"web_search_result","url":"https://example.com/a","title":"Alpha","encrypted_content":"` + encoded + `","page_age":"1 day"}]},
+				{"type":"text","text":"alpha is a letter"}
+			]},
+			{"role": "user", "content": "and beta?"}
+		]
+	}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+
+	handler.HandleAnthropicMessagesCountTokens(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status: got=%d, want=%d (body=%s)", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var countResp models.AnthropicCountTokensResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &countResp); err != nil {
+		t.Fatalf("decode count_tokens response %s: %v", recorder.Body.Bytes(), err)
+	}
+	if countResp.InputTokens != 222 {
+		t.Fatalf("input_tokens: got=%d, want=222", countResp.InputTokens)
+	}
+}

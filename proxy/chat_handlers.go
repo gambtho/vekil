@@ -2513,6 +2513,20 @@ func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.Anthro
 		clone.Tools = tools
 		countReq = &clone
 	}
+	// A conversation that already ran a mediated web_search carries synthesized
+	// server_tool_use / web_search_tool_result blocks, and translateMessage
+	// rejects unknown block types — so without this the very next count_tokens
+	// call 400s. Decoding them back to plain tool_use / tool_result reuses the
+	// one authoritative fail-closed decoder. Deliberately NOT gated on the
+	// web_search feature flag: a history can still carry blocks synthesized
+	// while the feature was enabled in an earlier session.
+	if messages, changed, err := decodeReplayedWebSearchMessages(req.Messages); err == nil && changed {
+		if countReq == req {
+			clone := *req
+			countReq = &clone
+		}
+		countReq.Messages = messages
+	}
 	oaiReq, err := TranslateAnthropicToOpenAI(countReq)
 	if err != nil {
 		return nil, err

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -58,6 +59,10 @@ func (u *webSearchLoopUpstream) handler() http.Handler {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
+			// Per-turn value so a test can prove the emitted turn carries the LAST
+			// turn's passthrough headers, the way real rate-limit counters move.
+			w.Header().Set("Anthropic-Ratelimit-Requests-Remaining", strconv.Itoa(index))
+			w.Header().Set("Content-Length", strconv.Itoa(len(turn)))
 			_, _ = io.WriteString(w, turn)
 		default:
 			http.NotFound(w, r)
