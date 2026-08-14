@@ -16,8 +16,123 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
+
+// webSearchLogEndpoint labels every debug line emitted by the mediated path so
+// internal traffic is never confused with the client's own /v1/messages turn.
+const webSearchLogEndpoint = "messages/web_search/internal"
+
+// forwardAnthropicMessagesWebSearch serves one mediated /v1/messages turn. It
+// returns true only when the client response has been written. Every false
+// return happens before markExplicitRouteDownstreamCommitment, so the caller can
+// always re-issue the ORIGINAL body through the normal passthrough and the
+// client sees exactly what it would have seen with the feature disabled.
+//
+// In production this runs with a NIL route operation: mediation only activates
+// for Copilot-owned conversation models, and providerKindSupportsExplicitEndpoint
+// refuses /v1/messages for Copilot targets, so withExplicitRouteOperation always
+// resolves a legacy route here. Every route-operation touch below is nil-safe.
+func (h *ProxyHandler) forwardAnthropicMessagesWebSearch(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest, m *webSearchMediation) bool {
+	if h == nil || req == nil || m == nil {
+		return false
+	}
+	skip := func(reason string, err error) bool {
+		fields := []logger.Field{
+			logger.F("endpoint", webSearchLogEndpoint),
+			logger.F("reason", reason),
+			logger.F("model", req.Model),
+		}
+		if err != nil {
+			fields = append(fields, logger.Err(err))
+		}
+		h.log.Debug("web search mediation fell back to passthrough", fields...)
+		return false
+	}
+
+	decoded, err := decodeReplayedWebSearchBlocks(body)
+	if err != nil {
+		return skip("replay_decode_failed", err)
+	}
+	rewritten, err := rewriteAnthropicWebSearchRequest(decoded, m)
+	if err != nil {
+		return skip("request_rewrite_failed", err)
+	}
+
+	// Internal spend is flushed on a context that survives client cancellation so
+	// delegated and continuation tokens are never lost to a disconnect.
+	usageCtx := context.WithoutCancel(r.Context())
+	defer h.flushWebSearchInternalUsage(usageCtx, m)
+
+	publicModel, _ := h.directAnthropicResponseModels(req)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
+	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
+	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), publicModel, providerEndpointMessages)
+	if err != nil {
+		return skip("route_operation_failed", err)
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
+	m.extraHeaders = anthropicExtraHeadersFromRequest(r)
+	m.publicModel = explicitRoutePublicModel(route, publicModel)
+	m.summary = RequestSummaryFromContext(r.Context())
+
+	message, err := h.runWebSearchLoop(upstreamCtx, rewritten, m)
+	if err != nil {
+		return skip("mediated_turn_failed", err)
+	}
+	message.Model = m.publicModel
+
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		return skip("response_encode_failed", err)
+	}
+	observeAnthropicUsageBody(r.Context(), encoded)
+
+	// Past this point the turn is committed downstream and fallback is forbidden.
+	markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
+	if req.Stream {
+		if err := writeAnthropicMessageAsSSE(w, message); err != nil {
+			h.log.Error("web search SSE replay failed",
+				logger.F("endpoint", webSearchLogEndpoint),
+				logger.F("reason", "sse_replay_write_failed"),
+				logger.Err(err),
+			)
+		}
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(encoded); err != nil {
+		h.log.Error("web search response write failed",
+			logger.F("endpoint", webSearchLogEndpoint),
+			logger.F("reason", "response_write_failed"),
+			logger.Err(err),
+		)
+	}
+	return true
+}
+
+// flushWebSearchInternalUsage books non-final loop turns and delegated /responses
+// spend additively. The emitted turn's own usage rides on the response body and
+// is observed separately, matching the direct path (upstream_http.go:734).
+func (h *ProxyHandler) flushWebSearchInternalUsage(ctx context.Context, m *webSearchMediation) {
+	if m == nil {
+		return
+	}
+	total := responsesUsage{
+		InputTokens: m.continuationUsage.InputTokens +
+			m.continuationUsage.CacheReadInputTokens +
+			m.continuationUsage.CacheCreationInputTokens +
+			m.delegatedUsage.InputTokens,
+		OutputTokens: m.continuationUsage.OutputTokens + m.delegatedUsage.OutputTokens,
+	}
+	total.TotalTokens = total.InputTokens + total.OutputTokens
+	observeInternalResponsesUsage(ctx, total)
+}
 
 const (
 	// anthropicWebSearchToolName is the tool name Anthropic uses for both the

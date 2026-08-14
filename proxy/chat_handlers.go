@@ -2006,6 +2006,11 @@ func (h *ProxyHandler) HandleAnthropicMessages(w http.ResponseWriter, r *http.Re
 	h.observeRequestSummaryWithProviderModel(r.Context(), "anthropic", req.Model, providerModel, req.Stream, providerEndpoint)
 
 	if directAnthropic {
+		if mediation, ok := h.webSearchMediationFor(&req); ok {
+			if h.forwardAnthropicMessagesWebSearch(w, r, body, &req, mediation) {
+				return
+			}
+		}
 		h.forwardAnthropicMessagesDirect(w, r, body, &req)
 		return
 	}
