@@ -885,12 +885,28 @@ func appendWebSearchContinuationTurn(body []byte, assistant []models.ContentBloc
 
 // decodeReplayedWebSearchBlocks converts Vekil-synthesized web_search blocks in
 // an inbound body back into the plain tool_use / tool_result shapes an upstream
-// understands. server_tool_use stays in the assistant turn; web_search_tool_result
-// moves into a user turn inserted immediately after it, because a tool_result is
-// not valid assistant content. Decoding is fail-closed: any token that is not a
-// well-formed Vekil result yields an is_error tool_result, so forged or truncated
-// encrypted_content can never reach the model as trusted text. Bodies with no
-// synthesized blocks are returned byte-for-byte unchanged.
+// understands. server_tool_use stays in the assistant turn (converted to
+// tool_use); web_search_tool_result moves into a user turn inserted
+// immediately after it, because a tool_result is not valid assistant content.
+//
+// Block POSITION, not just type, decides the split: anything that sat before
+// the turn's last synthesized result stays in a "pre" assistant message that
+// precedes the inserted tool_result turn; anything that sat after it (for
+// example the model's own answer text, which is causally downstream of the
+// result) moves into a new "post" assistant message inserted after the
+// tool_result turn — mirroring how appendWebSearchContinuationTurn already
+// composes a real continuation. A message can therefore expand into up to
+// three messages: pre-result assistant, result user turn, post-result
+// assistant. Either assistant side is omitted when empty, and a final pass
+// (avoidAdjacentSameRoleAnthropicMessages) guarantees that omission never
+// leaves two adjacent messages sharing a role.
+//
+// Decoding is fail-closed: any token that is not a well-formed Vekil result
+// yields an is_error tool_result, so forged or truncated encrypted_content can
+// never reach the model as trusted text. Bodies with no synthesized blocks are
+// returned byte-for-byte unchanged, and messages whose content decode did not
+// need to touch (including plain-string content) are left exactly as they
+// were unless an adjacency merge requires combining them with a neighbor.
 func decodeReplayedWebSearchBlocks(body []byte) ([]byte, error) {
 	if !bytes.Contains(body, []byte("server_tool_use")) && !bytes.Contains(body, []byte("web_search_tool_result")) {
 		return body, nil
@@ -913,67 +929,172 @@ func decodeReplayedWebSearchBlocks(body []byte) ([]byte, error) {
 	for _, message := range messages {
 		var blocks []models.ContentBlock
 		if err := json.Unmarshal(message.Content, &blocks); err != nil {
-			// Plain string content is equivalent to a single text block. Normalize
-			// it to array form here too, so every message in a rewritten body has
-			// a uniform content shape; a body with no synthesized blocks never
-			// reaches this loop; see the early return above.
-			normalized, ok := normalizeAnthropicStringContent(message.Content)
-			if !ok {
+			// Not a block array (plain string, or any other shape): nothing to
+			// convert here, so the message is passed through byte-for-byte.
+			rewritten = append(rewritten, message)
+			continue
+		}
+
+		lastResultIndex := -1
+		for index, block := range blocks {
+			if block.Type == "web_search_tool_result" {
+				lastResultIndex = index
+			}
+		}
+		if lastResultIndex == -1 {
+			// No synthesized result in this turn. A bare server_tool_use with no
+			// matching result should not normally occur, but converting it in
+			// place keeps this branch consistent without splitting the message.
+			turnChanged := false
+			kept := make([]models.ContentBlock, 0, len(blocks))
+			for _, block := range blocks {
+				if block.Type == "server_tool_use" {
+					turnChanged = true
+					block.Type = "tool_use"
+					if strings.TrimSpace(block.Name) == "" {
+						block.Name = anthropicWebSearchToolName
+					}
+				}
+				kept = append(kept, block)
+			}
+			if !turnChanged {
 				rewritten = append(rewritten, message)
 				continue
 			}
-			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: normalized})
+			changed = true
+			keptContent, err := json.Marshal(kept)
+			if err != nil {
+				return nil, err
+			}
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: keptContent})
 			continue
 		}
-		kept := make([]models.ContentBlock, 0, len(blocks))
+
+		changed = true
+		pre := make([]models.ContentBlock, 0, lastResultIndex)
+		post := make([]models.ContentBlock, 0, len(blocks)-lastResultIndex)
 		results := make([]json.RawMessage, 0, len(blocks))
-		turnChanged := false
-		for _, block := range blocks {
+		for index, block := range blocks {
 			switch block.Type {
 			case "server_tool_use":
-				turnChanged = true
 				block.Type = "tool_use"
 				if strings.TrimSpace(block.Name) == "" {
 					block.Name = anthropicWebSearchToolName
 				}
-				kept = append(kept, block)
+				if index < lastResultIndex {
+					pre = append(pre, block)
+				} else {
+					post = append(post, block)
+				}
 			case "web_search_tool_result":
-				turnChanged = true
 				text, ok := decodeReplayedWebSearchResultText(block.Content)
 				results = append(results, upstreamToolResultJSON(block.ToolUseID, text, !ok))
 			default:
-				kept = append(kept, block)
+				if index < lastResultIndex {
+					pre = append(pre, block)
+				} else {
+					post = append(post, block)
+				}
 			}
 		}
-		if !turnChanged {
-			rewritten = append(rewritten, message)
-			continue
-		}
-		changed = true
-		keptContent, err := json.Marshal(kept)
-		if err != nil {
-			return nil, err
-		}
-		if len(kept) > 0 || len(results) == 0 {
-			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: keptContent})
-		}
-		if len(results) > 0 {
-			resultContent, err := json.Marshal(results)
+
+		if len(pre) > 0 {
+			preContent, err := json.Marshal(pre)
 			if err != nil {
 				return nil, err
 			}
-			rewritten = append(rewritten, models.AnthropicMessage{Role: "user", Content: resultContent})
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: preContent})
+		}
+		resultContent, err := json.Marshal(results)
+		if err != nil {
+			return nil, err
+		}
+		rewritten = append(rewritten, models.AnthropicMessage{Role: "user", Content: resultContent})
+		if len(post) > 0 {
+			postContent, err := json.Marshal(post)
+			if err != nil {
+				return nil, err
+			}
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: postContent})
 		}
 	}
 	if !changed {
 		return body, nil
 	}
-	encoded, err := json.Marshal(rewritten)
+
+	merged, err := avoidAdjacentSameRoleAnthropicMessages(rewritten)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(merged)
 	if err != nil {
 		return nil, err
 	}
 	fields["messages"] = encoded
 	return json.Marshal(fields)
+}
+
+// avoidAdjacentSameRoleAnthropicMessages merges any two adjacent messages that
+// end up sharing a role after the pre/result/post split above. Anthropic
+// requires alternating roles, and omitting an empty pre- or post-result
+// assistant side (or splitting a floating, call-less result) can otherwise
+// leave the inserted tool_result user turn directly adjacent to an original
+// user message, or two assistant turns directly adjacent to each other. This
+// follows the same merge-adjacent-turns precedent as
+// mergeSplitAnthropicReplayAssistantTurns (proxy/translator.go) rather than
+// inventing a new approach. Only messages that actually end up adjacent
+// through this rewrite are merged; a body with no synthesized blocks never
+// reaches here (see the early return in decodeReplayedWebSearchBlocks), so
+// this never touches an unrelated request.
+func avoidAdjacentSameRoleAnthropicMessages(messages []models.AnthropicMessage) ([]models.AnthropicMessage, error) {
+	if len(messages) < 2 {
+		return messages, nil
+	}
+	merged := make([]models.AnthropicMessage, 0, len(messages))
+	for _, message := range messages {
+		if len(merged) > 0 && merged[len(merged)-1].Role == message.Role {
+			combined, err := mergeAnthropicMessageContents(merged[len(merged)-1].Content, message.Content)
+			if err != nil {
+				return nil, err
+			}
+			merged[len(merged)-1].Content = combined
+			continue
+		}
+		merged = append(merged, message)
+	}
+	return merged, nil
+}
+
+// mergeAnthropicMessageContents concatenates two messages' content in order,
+// tolerating either a plain string or a content-block array on either side. A
+// string side is converted to the equivalent single text block only here,
+// where a merge is actually required to keep roles alternating — never as a
+// blanket normalization of content the rewrite had no reason to touch.
+func mergeAnthropicMessageContents(a, b json.RawMessage) (json.RawMessage, error) {
+	blocksA, err := anthropicContentBlocks(a)
+	if err != nil {
+		return nil, err
+	}
+	blocksB, err := anthropicContentBlocks(b)
+	if err != nil {
+		return nil, err
+	}
+	combined := append(blocksA, blocksB...)
+	return json.Marshal(combined)
+}
+
+// anthropicContentBlocks normalizes one message's content field, which may be
+// a plain string or a content-block array, into a block slice.
+func anthropicContentBlocks(content json.RawMessage) ([]models.ContentBlock, error) {
+	var blocks []models.ContentBlock
+	if err := json.Unmarshal(content, &blocks); err == nil {
+		return blocks, nil
+	}
+	var text string
+	if err := json.Unmarshal(content, &text); err == nil {
+		return []models.ContentBlock{{Type: "text", Text: &text}}, nil
+	}
+	return nil, fmt.Errorf("anthropic message content is neither a block array nor a string")
 }
 
 // decodeReplayedWebSearchResultText returns the decoded snippet text and whether
@@ -995,20 +1116,4 @@ func decodeReplayedWebSearchResultText(content json.RawMessage) (string, bool) {
 		decoded = append(decoded, result)
 	}
 	return webSearchResultsText(decoded), true
-}
-
-// normalizeAnthropicStringContent converts a message's plain-string content
-// (Anthropic accepts either a string or a content-block array) into the
-// equivalent single-text-block array form. It reports false when content is
-// neither shape, so the caller can fall back to leaving it untouched.
-func normalizeAnthropicStringContent(content json.RawMessage) (json.RawMessage, bool) {
-	var text string
-	if err := json.Unmarshal(content, &text); err != nil {
-		return nil, false
-	}
-	encoded, err := json.Marshal([]models.ContentBlock{{Type: "text", Text: &text}})
-	if err != nil {
-		return nil, false
-	}
-	return encoded, true
 }
