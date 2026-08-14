@@ -215,6 +215,11 @@ func TestRunWebSearchLoopExhaustionEmitsMaxUsesExceeded(t *testing.T) {
 	if message.Usage.ServerToolUse.WebSearchRequests != 1 {
 		t.Fatalf("web_search_requests = %d; unserved calls must not be counted", message.Usage.ServerToolUse.WebSearchRequests)
 	}
+	// Exhaustion must not leave the upstream's tool_use stop_reason: the client
+	// cannot answer a server_tool_use call.
+	if message.StopReason == nil || *message.StopReason != "end_turn" {
+		t.Fatalf("stop_reason = %v, want end_turn", message.StopReason)
+	}
 }
 
 func TestRunWebSearchLoopMixedTurnResolvesInlineAndStops(t *testing.T) {

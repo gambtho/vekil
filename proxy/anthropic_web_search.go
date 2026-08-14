@@ -692,7 +692,9 @@ func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *web
 	dispatchCtx := withRouteAttemptKind(ctx, routeAttemptWebSearch)
 
 	var (
-		blocks    []models.ContentBlock
+		// Non-nil so an empty mediated turn serializes as "content": [], the shape
+		// passthrough would have produced; ContentBlock has no omitempty.
+		blocks    = make([]models.ContentBlock, 0, 4)
 		pending   *models.AnthropicResponse
 		delegated int
 		remaining = m.maxSearches
@@ -738,7 +740,8 @@ func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *web
 			if remaining <= 0 {
 				use, _ := synthesizeWebSearchBlocks(callID, query, nil)
 				blocks = append(blocks, use, webSearchErrorResultBlock(callID, "max_uses_exceeded"))
-				toolResults = append(toolResults, upstreamToolResultJSON(block.ID, "web search budget exhausted", true))
+				// No upstream tool_result is built for an unserved call: exhaustion
+				// ends the loop below, so no continuation turn is ever sent.
 				exhausted = true
 				continue
 			}
