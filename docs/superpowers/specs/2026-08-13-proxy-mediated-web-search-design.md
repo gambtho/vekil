@@ -84,6 +84,14 @@ Established from the repository and from probes against a live Copilot upstream.
   written (`proxy/chat_handlers.go:1683`).
 - `translator.go:288` hard-rejects unknown content block types, so synthesized
   blocks would 400 if a mediated conversation crossed to the translated path.
+- Explicit routes default to `MaxUpstreamSends: 1`
+  (`proxy/model_routes_config.go:1041-1045`); `reserveSendAtDispatch` decrements
+  it per dispatch and refuses further sends with `routeRetrySuppressedBudget`
+  once exhausted (`proxy/route_executor.go:499-519`). A multi-turn loop on the
+  client's own route operation is therefore refused on turn 2.
+- `shouldForwardAnthropicMessagesDirect` returns true for
+  `providerTypeAnthropicCompatible` as well as Copilot
+  (`proxy/chat_handlers.go:1626-1638`), where hosted `web_search` already works.
 
 ### Measured against live Copilot
 
@@ -115,11 +123,25 @@ Mediation engages only when all hold:
 
 1. `web_search.enabled` is true in the providers config.
 2. The inbound `/v1/messages` body carries a `type: web_search_*` tool.
-3. The model resolves to the direct-passthrough route.
-4. A delegate model is discoverable.
+3. The model resolves to the direct-passthrough route **and its provider is
+   `providerTypeCopilot`**.
+4. A delegate model is discoverable **on that same provider**.
 5. The client does not already define a client tool named `web_search`.
 
 Any miss falls through to today's passthrough, untouched.
+
+Condition 3 is a hard exclusion, not an optimization.
+`shouldForwardAnthropicMessagesDirect` also returns true for
+`providerTypeAnthropicCompatible` (`proxy/chat_handlers.go:1630-1632`), where
+hosted `web_search` **already works natively**. Mediating there would replace a
+working path with a synthesized approximation. Only Copilot-owned models, which
+have no other way to search, are eligible.
+
+Condition 4 constrains delegation to the conversation's own provider. Vekil is a
+multi-provider proxy and an unconstrained catalog scan could route a user's
+search queries to an Azure or Codex provider that has nothing to do with the
+conversation. That is a privacy boundary, not just a correctness one: search
+queries must not leave the provider the client is already talking to.
 
 Condition 5 avoids a renaming scheme for a rare case: a client that defines its
 own `web_search` client tool alongside the hosted one would make the intercepted
@@ -154,6 +176,38 @@ before re-POSTing.
 
 The loop terminates when the assistant turn contains no unresolved `web_search`
 call, when the budget is exhausted, or on a mixed turn.
+
+If the client omits `max_uses`, the ceiling is `max_searches` alone.
+
+#### Route send budget
+
+This is the constraint the loop must be built around. Explicit routes default to
+`MaxUpstreamSends: 1` (`proxy/model_routes_config.go:1041-1045`), every dispatch
+decrements it in `reserveSendAtDispatch`, and once exhausted further sends are
+refused with `routeRetrySuppressedBudget` (`proxy/route_executor.go:499-519`).
+A naive loop is therefore rejected on its second turn.
+
+Continuation dispatches must not consume the client's route budget. They get a
+first-class attempt kind of their own — the precedent is `routeAttemptCompaction`
+(`proxy/responses_handler.go:3106`) — with its own bounded counter derived from
+`max_searches`, plus target pinning so every continuation lands on the same
+target that served turn 1. Failover across targets mid-loop is not supported:
+a target change would invalidate the accumulated conversation state, so a failed
+continuation falls back to passthrough instead of switching targets.
+
+#### Budget exhaustion
+
+Exhaustion is client-visible and in-band, not a silent stop. When the assistant
+requests more searches than remain, the unserved calls are answered with:
+
+```json
+{"type":"web_search_tool_result","tool_use_id":"srvtoolu_…",
+ "content":{"type":"web_search_tool_result_error","error_code":"max_uses_exceeded"}}
+```
+
+`max_uses_exceeded` is Anthropic's own documented code for exactly this
+condition, so a compliant client already handles it. Note the error form's
+`content` is a single object, not a list.
 
 ### Delegation
 
@@ -192,11 +246,25 @@ is treated as a delegation failure.
 Copilot's internal fan-out, which is invisible to the client and can be an order
 of magnitude larger.
 
-`encrypted_content` is a Vekil-minted, versioned, size-capped opaque token that
+`encrypted_content` is a Vekil-minted, versioned, size-capped token that
 stateless-encodes the result snippet. It is deliberately not a store key: a
-stateless token survives proxy restart, unlike the Responses replay store. These
-tokens never reach Anthropic — Vekil is the only encoder and the only decoder —
-so there is no ciphertext to forge.
+stateless token survives proxy restart, unlike the Responses replay store.
+Format is a version prefix plus base64, mirroring `encodeSyntheticCompaction`
+(`proxy/compaction.go:19-24`).
+
+It is **not** authenticated encryption, and the spec does not claim it is. The
+client holds these tokens and returns them, so it can trivially forge one. That
+is acceptable because it grants no capability the client lacks: the client
+already controls the entire message history and can fabricate a `tool_result`
+containing arbitrary text. Forging a token is a longer path to something already
+permitted, not a privilege escalation. Nor is there a confidentiality
+requirement — the payload is search results the user asked for.
+
+What is required instead is strict handling: version check, size cap, and
+schema validation on decode, failing **closed** to a `web_search_tool_result_error`
+rather than passing malformed content to the model. Adding a MAC would mean key
+provisioning, rotation and replica-sharing for no threat that isn't already
+open, so it is deliberately excluded.
 
 Success `content` is a list; the error form is a single object
 (`web_search_tool_result_error`). These are different JSON types and must not be
@@ -241,8 +309,11 @@ wasted upstream call.
 
 Hard rule: never fall back after `markExplicitRouteDownstreamCommitment`.
 
-Combined with the error-envelope fix below, fail-open is indistinguishable from
-feature-off — matching the tool-optimizer contract in CLAUDE.md.
+When mediation is disabled, or when it declines to engage, the request is byte-for-byte
+what it is today. When mediation engages and then fails, the client sees the
+same outcome it would have seen with the feature off — modulo the error-envelope
+fix below, which deliberately changes that outcome for all direct-path errors.
+This matches the tool-optimizer fail-open contract in CLAUDE.md.
 
 ## Configuration
 
@@ -275,6 +346,12 @@ overridable via `delegate_model`. If none is found the feature no-ops.
 - `observeInternalResponsesUsage` for delegated tokens, flushed once via `defer`
   on a context that survives client cancellation, so internal spend is additive
   rather than clobbering the turn's usage.
+- **Continuation turns must be accounted too.** Existing direct-path accounting
+  observes only the emitted response body (`proxy/upstream_http.go:733-735`), so
+  loop turns 2..N would otherwise spend Copilot tokens invisibly. Their usage is
+  accumulated alongside the delegated Responses spend and flushed through the
+  same additive path. Without this, a three-search turn under-reports roughly
+  three model turns of tokens.
 - Debug logs labelled `messages/web_search/internal`, with a `reason` field on
   every skip and fallback.
 
@@ -292,6 +369,11 @@ internal units:
 | emitter | Synthesize blocks; write JSON or replay as SSE |
 
 ## Included fixes
+
+Both fixes below change behavior **even when `web_search.enabled` is false**.
+That is intentional and was an explicit scope decision, but it means the
+feature-off guarantee covers the mediation path only, not these two. Each is
+justified independently of the feature.
 
 **`AnthropicTool` decode.** `models.AnthropicTool`
 (`models/anthropic.go:58-63`) has only `Name`, `Description`, `InputSchema`, so
@@ -312,7 +394,12 @@ precedent for the shape.
 
 **Error envelope.** On the direct path, parse non-200 upstream bodies: relay
 verbatim when already Anthropic-shaped, otherwise wrap into
-`{"type":"error","error":{...}}` preserving status and message.
+`{"type":"error","error":{...}}` preserving status and message. Today
+`writeUpstreamResponse` copies them verbatim (`proxy/chat_handlers.go:1701`,
+`proxy/upstream_http.go:563-572`), so a Copilot-shaped body reaches an
+Anthropic-protocol client. Justified on its own terms: `/v1/messages` clients
+are entitled to the Anthropic error shape regardless of which provider served
+the request.
 
 ## Testing
 
@@ -322,8 +409,16 @@ New `proxy/anthropic_web_search_test.go` modeled on
 
 - disabled → bytes forwarded unchanged (assert exact body)
 - enabled, no hosted tool → unchanged
+- **anthropic-compatible provider → no mediation**, hosted tool forwarded intact
+- **delegate discovery never selects a model on another provider**
 - happy path: one search, correct block shapes and ids
 - loop bounded by the lower of `max_uses` and `max_searches`
+- **omitted `max_uses` → bounded by `max_searches` alone**
+- **exhaustion → `web_search_tool_result_error` with `max_uses_exceeded`,
+  `content` as a single object not a list**
+- **continuation dispatches do not consume the client's `MaxUpstreamSends`**
+- **malformed or forged `encrypted_content` → fails closed to an error block**,
+  never reaching the model
 - mixed turn: search resolved inline, client `tool_use` preserved,
   `stop_reason: tool_use`
 - delegation failure → original body reaches upstream, feature invisible
@@ -332,8 +427,8 @@ New `proxy/anthropic_web_search_test.go` modeled on
 - streaming replay: event order, and `web_search_tool_result` whole inside
   `content_block_start`
 - second turn: synthesized blocks decode back correctly
-- usage: `web_search_requests` counts delegated calls; delegated tokens land in
-  internal usage, not the turn's
+- usage: `web_search_requests` counts delegated calls; delegated tokens **and
+  continuation-turn tokens** land in internal usage, not the turn's
 
 Plus `proxy/providers_config_test.go` for strict-decode and defaults, mirroring
 the `tool_optimizer_config` default tests.
