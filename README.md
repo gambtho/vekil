@@ -25,6 +25,7 @@ Use your GitHub Copilot subscription with Claude Code, point the Codex CLI at Az
 - **OpenAI Chat Completions** and **Responses** APIs, including optional Codex websocket bridging
 - **Multi-provider routing** across GitHub Copilot, Azure OpenAI, OpenAI Codex, and generic compatible providers; schema v2 provides explicit routes, ordered failover, internal routes, and semantic policy routing
 - **Optional tool optimizers** for opt-in shell command rewrites and tool-output reduction across supported API surfaces; see [Tool Optimizers](docs/tool-optimizers.md)
+- **Optional proxy-mediated web search** so Anthropic's hosted `web_search` tool works for `claude-*` models on providers that reject it; see [Web Search](docs/web-search.md)
 - **Codex compatibility shims** for compaction and memory summarization
 - **Streaming**, tool use, parallel tool calls, compressed request bodies, and auth/token caching
 - **One-command Claude Code, Codex CLI, and GitHub Copilot CLI launchers** with ephemeral loopback proxies and no persistent client routing changes
@@ -107,6 +108,7 @@ Documentation lives under [`docs/`](docs/README.md); start with these:
 | [Semantic Policy Routing](docs/policy-routing.md)            | Schema-v2 policy selection and gates |
 | [Provider API Keys](docs/provider-api-keys.md)               | Where to get provider keys          |
 | [Tool Optimizers](docs/tool-optimizers.md)                   | Shell rewrite/output reduction      |
+| [Web Search](docs/web-search.md)                             | Mediated Anthropic web search       |
 | [Responses WebSocket](docs/responses-websocket.md)           | Websocket bridge tuning             |
 | [Client Examples](docs/clients.md)                           | Copy-paste snippets per client      |
 | [Agent Launchers](docs/agent-launchers.md)                   | One-command coding-agent sessions   |

@@ -12,6 +12,7 @@ This folder is intentionally split into small, single-purpose files so humans an
 | [`policy-routing.md`](policy-routing.md) | schema-v2 semantic policy routing, classifier privacy/trust, modes, fallbacks, metrics, evaluation, and rollout gates | policy schema, classifier behavior, supported surfaces, telemetry, or release gates change |
 | [`provider-api-keys.md`](provider-api-keys.md) | where to get provider API keys and how to map them into providers config | provider signup/key URLs or auth field guidance changes |
 | [`tool-optimizers.md`](tool-optimizers.md) | optional shell command rewrite and tool-output reduction config | optimizer config or behavior changes |
+| [`web-search.md`](web-search.md) | optional proxy-mediated Anthropic `web_search` config and behavior | web search mediation config, activation conditions, or emission behavior changes |
 | [`responses-websocket.md`](responses-websocket.md) | Codex-style `GET /v1/responses` websocket bridge tuning | websocket bridge, auto-compaction, or compact retry knobs change |
 | [`clients.md`](clients.md) | copy-paste client examples | onboarding snippets or client compatibility changes |
 | [`agent-launchers.md`](agent-launchers.md) | one-command coding-agent launchers, lifecycle, logs, and credential isolation | launcher targets, flags, process lifecycle, or child configuration changes |
