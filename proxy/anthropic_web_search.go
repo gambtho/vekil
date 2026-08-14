@@ -882,3 +882,133 @@ func appendWebSearchContinuationTurn(body []byte, assistant []models.ContentBloc
 	fields["messages"] = encoded
 	return json.Marshal(fields)
 }
+
+// decodeReplayedWebSearchBlocks converts Vekil-synthesized web_search blocks in
+// an inbound body back into the plain tool_use / tool_result shapes an upstream
+// understands. server_tool_use stays in the assistant turn; web_search_tool_result
+// moves into a user turn inserted immediately after it, because a tool_result is
+// not valid assistant content. Decoding is fail-closed: any token that is not a
+// well-formed Vekil result yields an is_error tool_result, so forged or truncated
+// encrypted_content can never reach the model as trusted text. Bodies with no
+// synthesized blocks are returned byte-for-byte unchanged.
+func decodeReplayedWebSearchBlocks(body []byte) ([]byte, error) {
+	if !bytes.Contains(body, []byte("server_tool_use")) && !bytes.Contains(body, []byte("web_search_tool_result")) {
+		return body, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	raw, ok := fields["messages"]
+	if !ok {
+		return body, nil
+	}
+	var messages []models.AnthropicMessage
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return nil, err
+	}
+
+	rewritten := make([]models.AnthropicMessage, 0, len(messages)+2)
+	changed := false
+	for _, message := range messages {
+		var blocks []models.ContentBlock
+		if err := json.Unmarshal(message.Content, &blocks); err != nil {
+			// Plain string content is equivalent to a single text block. Normalize
+			// it to array form here too, so every message in a rewritten body has
+			// a uniform content shape; a body with no synthesized blocks never
+			// reaches this loop; see the early return above.
+			normalized, ok := normalizeAnthropicStringContent(message.Content)
+			if !ok {
+				rewritten = append(rewritten, message)
+				continue
+			}
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: normalized})
+			continue
+		}
+		kept := make([]models.ContentBlock, 0, len(blocks))
+		results := make([]json.RawMessage, 0, len(blocks))
+		turnChanged := false
+		for _, block := range blocks {
+			switch block.Type {
+			case "server_tool_use":
+				turnChanged = true
+				block.Type = "tool_use"
+				if strings.TrimSpace(block.Name) == "" {
+					block.Name = anthropicWebSearchToolName
+				}
+				kept = append(kept, block)
+			case "web_search_tool_result":
+				turnChanged = true
+				text, ok := decodeReplayedWebSearchResultText(block.Content)
+				results = append(results, upstreamToolResultJSON(block.ToolUseID, text, !ok))
+			default:
+				kept = append(kept, block)
+			}
+		}
+		if !turnChanged {
+			rewritten = append(rewritten, message)
+			continue
+		}
+		changed = true
+		keptContent, err := json.Marshal(kept)
+		if err != nil {
+			return nil, err
+		}
+		if len(kept) > 0 || len(results) == 0 {
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: keptContent})
+		}
+		if len(results) > 0 {
+			resultContent, err := json.Marshal(results)
+			if err != nil {
+				return nil, err
+			}
+			rewritten = append(rewritten, models.AnthropicMessage{Role: "user", Content: resultContent})
+		}
+	}
+	if !changed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(rewritten)
+	if err != nil {
+		return nil, err
+	}
+	fields["messages"] = encoded
+	return json.Marshal(fields)
+}
+
+// decodeReplayedWebSearchResultText returns the decoded snippet text and whether
+// every result decoded. The error form (a single object) and any malformed or
+// forged token both report false so the caller emits an error tool_result.
+func decodeReplayedWebSearchResultText(content json.RawMessage) (string, bool) {
+	var entries []struct {
+		EncryptedContent string `json:"encrypted_content"`
+	}
+	if err := json.Unmarshal(content, &entries); err != nil || len(entries) == 0 {
+		return "web search result could not be decoded", false
+	}
+	decoded := make([]webSearchResult, 0, len(entries))
+	for _, entry := range entries {
+		result, ok := decodeWebSearchContent(entry.EncryptedContent)
+		if !ok {
+			return "web search result could not be decoded", false
+		}
+		decoded = append(decoded, result)
+	}
+	return webSearchResultsText(decoded), true
+}
+
+// normalizeAnthropicStringContent converts a message's plain-string content
+// (Anthropic accepts either a string or a content-block array) into the
+// equivalent single-text-block array form. It reports false when content is
+// neither shape, so the caller can fall back to leaving it untouched.
+func normalizeAnthropicStringContent(content json.RawMessage) (json.RawMessage, bool) {
+	var text string
+	if err := json.Unmarshal(content, &text); err != nil {
+		return nil, false
+	}
+	encoded, err := json.Marshal([]models.ContentBlock{{Type: "text", Text: &text}})
+	if err != nil {
+		return nil, false
+	}
+	return encoded, true
+}
