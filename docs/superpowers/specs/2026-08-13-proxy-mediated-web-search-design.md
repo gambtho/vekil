@@ -111,9 +111,12 @@ Established from the repository and from probes against a live Copilot upstream.
 - `filters.blocked_domains` is accepted and echoed, but **enforcement is
   unverified** — a single probe showed no blocked-domain citations, which is not
   proof. Vekil post-filters regardless.
-- `/v1/messages/count_tokens` is unaffected: 200 with and without the hosted
-  tool. It takes the translated path, and Copilot's `/chat/completions` accepts
-  the degenerate parameterless tool.
+- **`/v1/messages/count_tokens` must keep working.** It takes the translated
+  path, and Copilot's `/chat/completions` accepts the degenerate parameterless
+  tool, so it returns 200 today. Because rejection lands in the shared
+  `TranslateAnthropicToOpenAI`, the count_tokens probe must substitute the
+  stand-in function tool rather than reject — Claude Code calls count_tokens
+  routinely, and a 400 there would break clients whose message turns work fine.
 
 ## Design
 
@@ -187,13 +190,23 @@ decrements it in `reserveSendAtDispatch`, and once exhausted further sends are
 refused with `routeRetrySuppressedBudget` (`proxy/route_executor.go:499-519`).
 A naive loop is therefore rejected on its second turn.
 
-Continuation dispatches must not consume the client's route budget. They get a
-first-class attempt kind of their own — the precedent is `routeAttemptCompaction`
-(`proxy/responses_handler.go:3106`) — with its own bounded counter derived from
-`max_searches`, plus target pinning so every continuation lands on the same
-target that served turn 1. Failover across targets mid-loop is not supported:
-a target change would invalidate the accumulated conversation state, so a failed
-continuation falls back to passthrough instead of switching targets.
+**Every mediated dispatch, turn 1 included**, must run under its own attempt kind
+and counter — not just continuations. `HandleAnthropicMessages` admits a route
+operation onto the request context (`proxy/chat_handlers.go:1941-1950`) and the
+direct forwarder reuses it (`:1654`). If turn 1 drew on the client's counter, it
+would leave `remainingUpstreamSends == 0` and the passthrough fallback would
+itself be refused with `routeRetrySuppressedBudget` — the fail-open guarantee
+would be dead on arrival. The precedent for the attempt kind is
+`routeAttemptCompaction` (`proxy/responses_handler.go:3106`).
+
+Every continuation must also pin the same target that served turn 1. Failover
+across targets mid-loop is not supported: a target change would invalidate the
+accumulated conversation state, so a failed continuation falls back to
+passthrough instead of switching targets. Target pinning does not need a forced
+pin — the executor soft-pins on success and adding the mediation attempt kind to
+`allowsAutomaticTargetSwitch`'s deny list (`proxy/route_executor.go:468-470`)
+blocks the switch. A hard pin would persist into the fallback and strip its
+failover, so it is deliberately avoided.
 
 #### Budget exhaustion
 
@@ -391,6 +404,12 @@ via the chat-over-Responses bridge which backfills the schema
 ever answer. No current outcome works, so rejecting loses nothing. Anthropic's
 own org-level kill switch returns a 400 `invalid_request_error`, which is the
 precedent for the shape.
+
+The count_tokens probe is the exception: it substitutes the stand-in function
+tool for hosted `web_search_*` instead of rejecting, and rejects other hosted
+types as normal. Counting the tool the model will actually be given is the
+meaningful number, and it keeps count_tokens working for clients that send
+hosted web search.
 
 **Error envelope.** On the direct path, parse non-200 upstream bodies: relay
 verbatim when already Anthropic-shaped, otherwise wrap into
