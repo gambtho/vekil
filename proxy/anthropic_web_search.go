@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/sozercan/vekil/models"
@@ -60,4 +61,42 @@ func clientDefinesWebSearchTool(tools []models.AnthropicTool) bool {
 func isAnthropicClientTool(tool models.AnthropicTool) bool {
 	toolType := strings.TrimSpace(tool.Type)
 	return toolType == "" || strings.EqualFold(toolType, anthropicClientToolType)
+}
+
+// webSearchStandInInputSchema is the client-tool schema that replaces
+// Anthropic's hosted web_search tool. Mediation sends exactly this shape
+// upstream, so anything that reasons about the mediated request — token
+// counting included — must use exactly this shape too.
+const webSearchStandInInputSchema = `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`
+
+// webSearchStandInTool is the client tool the proxy substitutes for Anthropic's
+// hosted web_search server tool.
+func webSearchStandInTool() models.AnthropicTool {
+	return models.AnthropicTool{
+		Name:        anthropicWebSearchToolName,
+		InputSchema: json.RawMessage(webSearchStandInInputSchema),
+	}
+}
+
+// translateAnthropicToolsForTokenCount replaces hosted web_search tools with the
+// stand-in the proxy actually sends upstream, so /v1/messages/count_tokens keeps
+// working for clients that declare the hosted tool and reports the count for the
+// tool the model will really be given. Other hosted types have no stand-in and
+// are left in place for TranslateAnthropicToOpenAI to reject. The input slice is
+// never mutated; the second result reports whether a copy was made.
+func translateAnthropicToolsForTokenCount(tools []models.AnthropicTool) ([]models.AnthropicTool, bool) {
+	out := tools
+	substituted := false
+	for index, tool := range tools {
+		if !strings.HasPrefix(strings.TrimSpace(tool.Type), anthropicHostedWebSearchTypePrefix) {
+			continue
+		}
+		if !substituted {
+			out = make([]models.AnthropicTool, len(tools))
+			copy(out, tools)
+			substituted = true
+		}
+		out[index] = webSearchStandInTool()
+	}
+	return out, substituted
 }

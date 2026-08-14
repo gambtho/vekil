@@ -2500,7 +2500,15 @@ func (h *ProxyHandler) HandleAnthropicMessagesCountTokens(w http.ResponseWriter,
 }
 
 func prepareAnthropicCountTokensProbeRequestWithModelOverride(req *models.AnthropicRequest, modelOverride string) (*models.OpenAIRequest, error) {
-	oaiReq, err := TranslateAnthropicToOpenAI(req)
+	countReq := req
+	if tools, substituted := translateAnthropicToolsForTokenCount(req.Tools); substituted {
+		// Shallow-copy so the caller's request keeps the client's original tools;
+		// only the probe sees the stand-in.
+		clone := *req
+		clone.Tools = tools
+		countReq = &clone
+	}
+	oaiReq, err := TranslateAnthropicToOpenAI(countReq)
 	if err != nil {
 		return nil, err
 	}
