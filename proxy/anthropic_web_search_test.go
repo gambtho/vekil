@@ -1019,3 +1019,27 @@ func TestFilterWebSearchResultsIsAuthoritative(t *testing.T) {
 		t.Fatalf("len(unbounded) = %d, want 3 with no filters and max_results=3", len(unbounded))
 	}
 }
+
+// TestFilterWebSearchResultsNormalizesTrailingDotHosts guards against a
+// blocklist bypass: "spam.test." is DNS-equivalent to "spam.test" and fully
+// resolvable as the blocked domain, so a naive string comparison that treats
+// the trailing root-label dot as significant lets a blocked result through
+// (and, symmetrically, drops an otherwise-allowed one).
+func TestFilterWebSearchResultsNormalizesTrailingDotHosts(t *testing.T) {
+	results := []webSearchResult{
+		{URL: "https://spam.test./evades-blocklist", Title: "trailing-dot blocked host"},
+		{URL: "https://example.com./trailing-dot-allowed", Title: "trailing-dot allowed host"},
+	}
+	tool := models.AnthropicTool{
+		AllowedDomains: []string{"example.com"},
+		BlockedDomains: []string{"spam.test"},
+	}
+
+	filtered := filterWebSearchResults(results, tool, 10)
+	if len(filtered) != 1 {
+		t.Fatalf("len(filtered) = %d, want 1: %#v", len(filtered), filtered)
+	}
+	if filtered[0].URL != "https://example.com./trailing-dot-allowed" {
+		t.Fatalf("filtered = %#v, want only the trailing-dot allowed host to survive", filtered)
+	}
+}

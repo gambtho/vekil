@@ -485,7 +485,11 @@ func webSearchResultHost(rawURL string) string {
 	if err != nil || parsed.Scheme == "" {
 		return ""
 	}
-	return strings.ToLower(parsed.Hostname())
+	// A trailing root-label dot (e.g. "spam.test.") is DNS-equivalent to
+	// "spam.test" and fully resolvable as such, so it must not evade
+	// blocked_domains or fail allowed_domains just by comparing unequal
+	// strings.
+	return strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
 }
 
 func webSearchHostMatchesAny(host string, domains []string) bool {
@@ -493,6 +497,10 @@ func webSearchHostMatchesAny(host string, domains []string) bool {
 		candidate := strings.ToLower(strings.TrimSpace(domain))
 		candidate = strings.TrimPrefix(candidate, "*.")
 		candidate = strings.TrimPrefix(candidate, ".")
+		// Normalize a trailing dot on the configured domain too, so a
+		// blocked_domains/allowed_domains entry authored with a root-label
+		// dot still compares equal to a host without one.
+		candidate = strings.TrimSuffix(candidate, ".")
 		if candidate == "" {
 			continue
 		}
