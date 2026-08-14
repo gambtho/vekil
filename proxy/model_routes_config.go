@@ -1247,7 +1247,7 @@ func compileExplicitModelRoutes(cfg ProvidersConfig, providers map[string]*provi
 }
 
 var topLevelProviderConfigFields = configFieldSet(
-	"schema_version", "providers", "model_routes", "policy_profiles", "tool_optimizers", "insight_model",
+	"schema_version", "providers", "model_routes", "policy_profiles", "tool_optimizers", "web_search", "insight_model",
 )
 
 var providerConfigFields = configFieldSet(

@@ -268,6 +268,7 @@ type ProxyHandler struct {
 	azureIdentityTokenSourceFactory  azureIdentityTokenSourceFactory
 	toolOptimizers                   *ToolOptimizerManager
 	toolContexts                     *ToolExecutionContextStore
+	webSearch                        WebSearchConfig
 	responsesWS                      ResponsesWebSocketConfig
 	responsesWSSessionsMu            sync.Mutex
 	responsesWSSessions              map[*responsesWebSocketSession]struct{}
@@ -883,6 +884,7 @@ func NewProxyHandler(a *auth.Authenticator, log *logger.Logger, opts ...Option) 
 		return nil, err
 	}
 	h.initializeToolOptimizers()
+	h.initializeWebSearch()
 	if err := h.initializeProviders(); err != nil {
 		h.BeginShutdown()
 		return nil, err

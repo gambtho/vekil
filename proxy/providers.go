@@ -67,6 +67,7 @@ type ProvidersConfig struct {
 	ModelRoutes    []ModelRouteConfig    `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
 	PolicyProfiles []PolicyProfileConfig `json:"policy_profiles,omitempty" yaml:"policy_profiles,omitempty"`
 	ToolOptimizers ToolOptimizersConfig  `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+	WebSearch      WebSearchConfig       `json:"web_search,omitempty" yaml:"web_search,omitempty"`
 	// InsightModel is the public model ID the dashboard uses to generate
 	// natural-language traffic insights on demand. Empty disables the feature
 	// (the dashboard's "Generate insights" button is hidden). The model must be
@@ -266,6 +267,7 @@ func LoadProvidersConfigFile(path string) (ProvidersConfig, error) {
 	if err != nil {
 		return cfg, fmt.Errorf("validate providers config %q: %w", path, err)
 	}
+	validated.config.WebSearch = validated.config.WebSearch.withDefaults()
 	return validated.config, nil
 }
 

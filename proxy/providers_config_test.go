@@ -2113,3 +2113,111 @@ func TestDecodeProviderModelsDuplicatePreservesAdvertisedEndpoints(t *testing.T)
 		})
 	}
 }
+
+func TestLoadProvidersConfigFileWebSearchBlock(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		file string
+		body string
+	}{
+		{
+			name: "json",
+			file: "providers.json",
+			body: `{
+  "providers": [{"id": "copilot", "type": "copilot", "default": true}],
+  "web_search": {
+    "enabled": true,
+    "max_searches": 3
+  }
+}`,
+		},
+		{
+			name: "yaml",
+			file: "providers.yaml",
+			body: `schema_version: 2
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+web_search:
+  enabled: true
+  max_searches: 3
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), tc.file)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write providers config: %v", err)
+			}
+
+			cfg, err := LoadProvidersConfigFile(providersPath)
+			if err != nil {
+				t.Fatalf("LoadProvidersConfigFile() error = %v", err)
+			}
+			if !cfg.WebSearch.Enabled {
+				t.Fatalf("web_search.enabled: got=false, want=true")
+			}
+			if cfg.WebSearch.MaxSearches != 3 {
+				t.Fatalf("web_search.max_searches: got=%d, want=3", cfg.WebSearch.MaxSearches)
+			}
+			if cfg.WebSearch.TimeoutMS != defaultWebSearchTimeoutMS {
+				t.Fatalf("web_search.timeout_ms: got=%d, want=%d",
+					cfg.WebSearch.TimeoutMS, defaultWebSearchTimeoutMS)
+			}
+		})
+	}
+}
+
+func TestLoadProvidersConfigFileWebSearchRejectsUnknownField(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		file string
+		body string
+	}{
+		{
+			name: "json",
+			file: "providers.json",
+			body: `{
+  "providers": [{"id": "copilot", "type": "copilot", "default": true}],
+  "web_search": {"enabled": true, "max_seaches": 3}
+}`,
+		},
+		{
+			name: "yaml",
+			file: "providers.yaml",
+			body: `schema_version: 2
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+web_search:
+  enabled: true
+  max_seaches: 3
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			providersPath := filepath.Join(t.TempDir(), tc.file)
+			if err := os.WriteFile(providersPath, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write providers config: %v", err)
+			}
+
+			_, err := LoadProvidersConfigFile(providersPath)
+			if err == nil {
+				t.Fatalf("LoadProvidersConfigFile(): got nil error, want unknown-field rejection")
+			}
+			if !strings.Contains(err.Error(), "max_seaches") {
+				t.Fatalf("error: got=%q, want substring=%q", err.Error(), "max_seaches")
+			}
+		})
+	}
+}
