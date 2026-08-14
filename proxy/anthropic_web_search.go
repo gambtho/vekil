@@ -811,11 +811,22 @@ func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *web
 		// passthrough would have produced; ContentBlock has no omitempty.
 		blocks    = make([]models.ContentBlock, 0, 4)
 		pending   *models.AnthropicResponse
+		emitted   bool
 		delegated int
 		remaining = m.maxSearches
 		turn      int
 		override  string
 	)
+	// Every completed turn is internal spend except the one actually emitted to
+	// the client, whose usage rides on the response body. The in-loop call below
+	// books a turn once its successor arrives; this books the last completed turn
+	// when no successor ever does, so a mid-loop failure cannot silently discard
+	// tokens that were really spent.
+	defer func() {
+		if pending != nil && !emitted {
+			addAnthropicUsage(&m.continuationUsage, pending.Usage)
+		}
+	}()
 	for {
 		// The executor soft-pins the target on first success, so from turn 2 on
 		// every mediated dispatch must already be bound to one target. A missing
@@ -826,6 +837,15 @@ func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *web
 		resp, err := h.executeAnthropicMessagesRouteRequest(dispatchCtx, body, m.extraHeaders, false, m.publicModel)
 		if err != nil {
 			return nil, err
+		}
+		// Mediation turns one client request into N upstream requests, so
+		// upstream_sends must see the multiplier. The guard is what makes this
+		// safe both now and later: with no route operation the dispatch is legacy
+		// and nothing else counts it, and when an operation exists the executor's
+		// RecordUpstreamAttempt already did. Exactly one of the two ever fires.
+		// Same reasoning as the delegated /responses send in delegateWebSearch.
+		if operation == nil {
+			m.summary.RecordUpstreamSend()
 		}
 		message, err := readMediatedAnthropicMessage(resp)
 		if err != nil {
@@ -897,6 +917,7 @@ func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *web
 	final.Usage = pending.Usage
 	final.Usage.ServerToolUse = &models.AnthropicServerToolUse{WebSearchRequests: delegated}
 	m.delegatedCalls = delegated
+	emitted = true
 	return &final, nil
 }
 

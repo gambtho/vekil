@@ -214,12 +214,72 @@ func TestHandleAnthropicMessagesWebSearchAccountsInternalSpend(t *testing.T) {
 	if extraPrompt != 18 || extraCompletion != 8 {
 		t.Fatalf("internal usage got = %d/%d, want = 18/8", extraPrompt, extraCompletion)
 	}
-	// Only the delegated /responses send is counted here. The two mediated
-	// Messages dispatches run on a legacy Copilot route, which has no route
-	// operation and therefore never reaches RecordUpstreamAttempt — the same as
-	// any other legacy Copilot dispatch today. Counting them separately would
-	// double-count the moment Copilot gains an explicit /v1/messages route.
-	if got := summary.UpstreamSendCount(); got != 1 {
-		t.Fatalf("upstream_sends got = %d, want = 1", got)
+	// Three physical dispatches: two mediated Messages turns plus the delegated
+	// /responses search. The loop's own RecordUpstreamSend is nil-operation
+	// guarded, so on this legacy Copilot route mediation is the only counter;
+	// were Copilot ever to own an explicit /v1/messages route, the executor's
+	// RecordUpstreamAttempt would count instead and the guard would skip. Exactly
+	// one of the two fires per dispatch, so the total cannot double.
+	if got := summary.UpstreamSendCount(); got != 3 {
+		t.Fatalf("upstream_sends got = %d, want = 3", got)
+	}
+}
+
+func TestHandleAnthropicMessagesWebSearchKeepsCompletedTurnSpendOnMidLoopFailure(t *testing.T) {
+	var messageDispatches int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case providerEndpointModels:
+			_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []any{
+				map[string]any{"id": "claude-mediated", "supported_endpoints": []string{providerEndpointMessages}},
+				map[string]any{"id": "gpt-delegate", "supported_endpoints": []string{providerEndpointResponses}},
+			}})
+		case providerEndpointResponses:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"output": []any{map[string]any{"type": "message", "content": []any{
+					map[string]any{"type": "output_text", "text": `[{"url":"https://example.com/a","title":"A","snippet":"alpha","page_age":"1 day"}]`},
+				}}},
+				"usage": map[string]any{"input_tokens": 7, "output_tokens": 3},
+			})
+		case providerEndpointMessages:
+			_, _ = io.ReadAll(r.Body)
+			messageDispatches++
+			if messageDispatches > 1 {
+				// The continuation turn fails. 400 is deliberate: it is terminal,
+				// so neither the loop nor the passthrough fallback retries it and
+				// the test stays fast.
+				http.Error(w, "continuation rejected", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"claude-mediated","stop_reason":"tool_use","stop_sequence":null,"content":[{"type":"tool_use","id":"toolu_a","name":"web_search","input":{"query":"alpha"}}],"usage":{"input_tokens":11,"output_tokens":5}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	h := newWebSearchIngressTestHandler(t, upstream.URL)
+	h.webSearch = enabledWebSearchIngressConfig()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-mediated","messages":[{"role":"user","content":"alpha"}],"max_tokens":64,"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":3}]}`)))
+	summaryCtx, summary := WithRequestSummary(req.Context())
+	req = req.WithContext(summaryCtx)
+	rec := httptest.NewRecorder()
+	h.HandleAnthropicMessages(rec, req)
+
+	// The mediated turn failed, so the client was served by the passthrough
+	// fallback: the opening mediated turn, the failing continuation, then the
+	// fallback dispatch of the original body.
+	if messageDispatches != 3 {
+		t.Fatalf("messages dispatches got = %d, want = 3 (two mediated turns plus passthrough fallback)", messageDispatches)
+	}
+	// Turn 1 completed (11/5) and the delegated search completed (7/3) before the
+	// continuation failed. Both were really spent and must still be accounted for,
+	// even though no turn was ever emitted to the client.
+	summary.mu.Lock()
+	extraPrompt, extraCompletion := summary.extraPromptTokens, summary.extraCompletionTokens
+	summary.mu.Unlock()
+	if extraPrompt != 18 || extraCompletion != 8 {
+		t.Fatalf("internal usage got = %d/%d, want = 18/8", extraPrompt, extraCompletion)
 	}
 }
