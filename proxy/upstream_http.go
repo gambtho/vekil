@@ -579,6 +579,138 @@ func writeUpstreamResponse(w http.ResponseWriter, resp *http.Response) error {
 	return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
 }
 
+// anthropicUpstreamErrorMaxBytes bounds how much of a non-200 upstream body the
+// direct Anthropic path buffers to decide whether it already carries an
+// Anthropic error envelope. It mirrors the policy classifier's response cap
+// (proxy/chat_policy_classifier.go:693-694); real provider error bodies are
+// orders of magnitude smaller, and a pathological one is relayed verbatim
+// rather than buffered whole.
+const anthropicUpstreamErrorMaxBytes = 64 << 10
+
+// writeAnthropicUpstreamErrorResponse relays a non-200 upstream response to an
+// Anthropic-protocol client. A body that already parses as an Anthropic error
+// envelope is relayed byte-for-byte so provider-specific detail (request ids,
+// extra fields) survives; anything else is wrapped so /v1/messages clients see
+// the Anthropic error shape no matter which provider served the request. The
+// status code is always preserved, and oversized or unreadable bodies fall back
+// to the verbatim relay writeUpstreamResponse would have done.
+func writeAnthropicUpstreamErrorResponse(w http.ResponseWriter, resp *http.Response) error {
+	if resp == nil || resp.Body == nil {
+		return &responseBodyWriteError{err: fmt.Errorf("upstream response body is unavailable"), upstream: true}
+	}
+	body := newLifecycleAwareReadCloser(resp.Body, responseRequestContext(resp))
+	defer func() { _ = body.Close() }()
+
+	// Read one byte past the cap so a complete body is distinguishable from an
+	// oversized one.
+	prefix, err := io.ReadAll(io.LimitReader(body, anthropicUpstreamErrorMaxBytes+1))
+	if body.canceledAtFailure() {
+		return newResponseBodyWriteError(resp, context.Canceled, false, true, body.canceledAtFailure())
+	}
+	if err != nil {
+		return newResponseBodyWriteError(resp, err, false, true, body.canceledAtFailure())
+	}
+	copyPassthroughHeaders(w.Header(), resp.Header)
+
+	if len(prefix) > anthropicUpstreamErrorMaxBytes {
+		// Oversized: stream prefix + remainder unchanged so memory stays bounded
+		// and any copied Content-Length remains correct.
+		w.WriteHeader(resp.StatusCode)
+		if _, err := w.Write(prefix); err != nil {
+			return newResponseBodyWriteError(resp, err, true, false, false)
+		}
+		tracked := &bodyCopyWriter{w: w}
+		_, err = io.Copy(tracked, body)
+		if body.canceledAtFailure() {
+			return newResponseBodyWriteError(resp, context.Canceled, true, true, body.canceledAtFailure())
+		}
+		if err != nil {
+			return newResponseBodyWriteError(resp, err, true, tracked.writeErr == nil, body.canceledAtFailure())
+		}
+		return nil
+	}
+
+	if isAnthropicErrorEnvelope(prefix) {
+		w.WriteHeader(resp.StatusCode)
+		if _, err := w.Write(prefix); err != nil {
+			return newResponseBodyWriteError(resp, err, true, false, false)
+		}
+		return nil
+	}
+
+	wrapped, err := json.Marshal(anthropicErrorEnvelope(
+		mapAnthropicUpstreamStatus(resp.StatusCode),
+		anthropicUpstreamErrorMessage(prefix, resp.StatusCode),
+	))
+	if err != nil {
+		// Marshaling a two-string envelope cannot realistically fail; if it does,
+		// relaying the original body is strictly better than dropping it.
+		w.WriteHeader(resp.StatusCode)
+		if _, writeErr := w.Write(prefix); writeErr != nil {
+			return newResponseBodyWriteError(resp, writeErr, true, false, false)
+		}
+		return nil
+	}
+
+	// The body is replaced, so headers describing the original bytes must not
+	// survive the rewrite.
+	w.Header().Del("Content-Encoding")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(wrapped)))
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(wrapped); err != nil {
+		return newResponseBodyWriteError(resp, err, true, false, false)
+	}
+	return nil
+}
+
+// isAnthropicErrorEnvelope reports whether body is already shaped as an
+// Anthropic error response, in which case it is relayed untouched.
+func isAnthropicErrorEnvelope(body []byte) bool {
+	var parsed struct {
+		Type  string          `json:"type"`
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false
+	}
+	return parsed.Type == "error" && len(parsed.Error) > 0
+}
+
+// anthropicUpstreamErrorMessage extracts the most useful human-readable message
+// from a non-Anthropic error body, preferring the OpenAI-compatible
+// {"error":{"message":…}} shape and falling back to the raw body text.
+func anthropicUpstreamErrorMessage(body []byte, statusCode int) string {
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		if message := strings.TrimSpace(parsed.Error.Message); message != "" {
+			return message
+		}
+		if message := strings.TrimSpace(parsed.Message); message != "" {
+			return message
+		}
+	}
+	if raw := strings.TrimSpace(string(body)); raw != "" {
+		return raw
+	}
+	return fmt.Sprintf("upstream returned HTTP %d", statusCode)
+}
+
+// anthropicErrorEnvelope builds the Anthropic error response shape. The nested
+// struct in models.AnthropicError is anonymous, so it is populated by field
+// assignment rather than a composite literal.
+func anthropicErrorEnvelope(errType, message string) models.AnthropicError {
+	envelope := models.AnthropicError{Type: "error"}
+	envelope.Error.Type = errType
+	envelope.Error.Message = message
+	return envelope
+}
+
 // writeOpenAIChatCompletionResponse writes a non-streaming OpenAI chat response,
 // normalizing missing required Chat Completions fields for strict SDK clients
 // while preserving vendor-specific fields. It only rewrites successful JSON

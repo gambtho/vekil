@@ -1698,7 +1698,7 @@ func (h *ProxyHandler) forwardAnthropicMessagesDirect(w http.ResponseWriter, r *
 		return
 	}
 
-	_ = writeUpstreamResponse(w, resp)
+	_ = writeAnthropicUpstreamErrorResponse(w, resp)
 }
 
 func (h *ProxyHandler) postAnthropicMessagesCountTokensForModel(ctx context.Context, body []byte, extraHeaders http.Header, model string) (*http.Response, error) {
