@@ -55,11 +55,20 @@ type AnthropicImageSource struct {
 	URL       string `json:"url,omitempty"`
 }
 
-// AnthropicTool defines a tool available for the model to call.
+// AnthropicTool defines a tool available for the model to call. Client tools
+// carry no Type (or "custom") and a JSON Schema; Anthropic's hosted server
+// tools instead carry a versioned Type plus tool-specific configuration. All
+// fields are decoded so callers can distinguish the two shapes; this package
+// stays data-only and interprets none of them.
 type AnthropicTool struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	InputSchema json.RawMessage `json:"input_schema"`
+	Name           string          `json:"name"`
+	Description    string          `json:"description,omitempty"`
+	InputSchema    json.RawMessage `json:"input_schema"`
+	Type           string          `json:"type,omitempty"`
+	MaxUses        *int            `json:"max_uses,omitempty"`
+	AllowedDomains []string        `json:"allowed_domains,omitempty"`
+	BlockedDomains []string        `json:"blocked_domains,omitempty"`
+	UserLocation   json.RawMessage `json:"user_location,omitempty"`
 }
 
 // AnthropicThinking configures extended thinking. Type can be "enabled"
@@ -89,10 +98,17 @@ type AnthropicResponse struct {
 
 // AnthropicUsage contains token usage statistics.
 type AnthropicUsage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	InputTokens              int                     `json:"input_tokens"`
+	OutputTokens             int                     `json:"output_tokens"`
+	CacheCreationInputTokens int                     `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int                     `json:"cache_read_input_tokens,omitempty"`
+	ServerToolUse            *AnthropicServerToolUse `json:"server_tool_use,omitempty"`
+}
+
+// AnthropicServerToolUse reports how many server-tool invocations a turn
+// consumed.
+type AnthropicServerToolUse struct {
+	WebSearchRequests int `json:"web_search_requests"`
 }
 
 // AnthropicCountTokensResponse is the response from the Anthropic
