@@ -1,7 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -478,6 +483,158 @@ func filterWebSearchResults(results []webSearchResult, tool models.AnthropicTool
 		}
 	}
 	return filtered
+}
+
+const (
+	// webSearchContentVersion prefixes every minted encrypted_content token,
+	// mirroring encodeSyntheticCompaction (proxy/compaction.go:19-25).
+	webSearchContentVersion = "vkws1:"
+	// webSearchMaxContentBytes caps a minted token and rejects an oversize one
+	// on the way back in.
+	webSearchMaxContentBytes = 8192
+	webSearchCallIDPrefix    = "srvtoolu_"
+)
+
+type webSearchResultItem struct {
+	Type             string `json:"type"`
+	URL              string `json:"url"`
+	Title            string `json:"title"`
+	EncryptedContent string `json:"encrypted_content"`
+	PageAge          string `json:"page_age"`
+}
+
+type webSearchResultErrorContent struct {
+	Type      string `json:"type"`
+	ErrorCode string `json:"error_code"`
+}
+
+func newWebSearchCallID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		// crypto/rand failure is fatal for uniqueness; fall back to a
+		// time-derived id rather than emitting a colliding constant.
+		binary.BigEndian.PutUint64(raw[0:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(raw[8:16], uint64(time.Now().UnixNano())^0x9e3779b97f4a7c15)
+	}
+	// 16 random bytes encode to exactly 22 base64url characters.
+	return webSearchCallIDPrefix + base64.RawURLEncoding.EncodeToString(raw[:])
+}
+
+// encodeWebSearchContent mints the stateless token handed to the client as
+// encrypted_content. It is deliberately NOT authenticated encryption: the
+// client already controls the whole message history, so forging one grants no
+// capability it lacks. What matters is that decode is strict.
+func encodeWebSearchContent(r webSearchResult) string {
+	encoded := encodeWebSearchContentOnce(r)
+	for len(encoded) > webSearchMaxContentBytes && len(r.Snippet) > 0 {
+		r.Snippet = truncateUTF8Prefix(r.Snippet, len(r.Snippet)/2)
+		encoded = encodeWebSearchContentOnce(r)
+	}
+	if len(encoded) > webSearchMaxContentBytes {
+		// Identity fields alone still exceed the cap; drop the payload rather
+		// than mint a token that will fail closed on the way back.
+		return ""
+	}
+	return encoded
+}
+
+func encodeWebSearchContentOnce(r webSearchResult) string {
+	payload, err := json.Marshal(r)
+	if err != nil {
+		return ""
+	}
+	return webSearchContentVersion + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// decodeWebSearchContent fails closed. A wrong or missing version prefix, an
+// oversize token, bad base64 or bad JSON all return ok=false so malformed or
+// forged content is never passed through to the model.
+func decodeWebSearchContent(encoded string) (webSearchResult, bool) {
+	if len(encoded) > webSearchMaxContentBytes {
+		return webSearchResult{}, false
+	}
+	if !strings.HasPrefix(encoded, webSearchContentVersion) {
+		return webSearchResult{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encoded, webSearchContentVersion))
+	if err != nil {
+		return webSearchResult{}, false
+	}
+	var result webSearchResult
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return webSearchResult{}, false
+	}
+	if decoder.More() {
+		return webSearchResult{}, false
+	}
+	return result, true
+}
+
+func truncateUTF8Prefix(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if limit >= len(s) {
+		return s
+	}
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit]
+}
+
+// synthesizeWebSearchBlocks builds the pair Anthropic clients expect for a
+// completed server tool call. The success content is a JSON list; the error
+// form (webSearchErrorResultBlock) is a single object. That distinction is
+// load-bearing and must not be conflated.
+func synthesizeWebSearchBlocks(callID, query string, results []webSearchResult) (models.ContentBlock, models.ContentBlock) {
+	input, err := json.Marshal(map[string]string{"query": query})
+	if err != nil {
+		input = []byte(`{"query":""}`)
+	}
+	items := make([]webSearchResultItem, 0, len(results))
+	for _, result := range results {
+		items = append(items, webSearchResultItem{
+			Type:             "web_search_result",
+			URL:              result.URL,
+			Title:            result.Title,
+			EncryptedContent: encodeWebSearchContent(result),
+			PageAge:          result.PageAge,
+		})
+	}
+	content, err := json.Marshal(items)
+	if err != nil {
+		content = []byte("[]")
+	}
+	use := models.ContentBlock{
+		Type:  "server_tool_use",
+		ID:    callID,
+		Name:  anthropicWebSearchToolName,
+		Input: input,
+	}
+	result := models.ContentBlock{
+		Type:      "web_search_tool_result",
+		ToolUseID: callID,
+		Content:   content,
+	}
+	return use, result
+}
+
+func webSearchErrorResultBlock(callID, errorCode string) models.ContentBlock {
+	content, err := json.Marshal(webSearchResultErrorContent{
+		Type:      "web_search_tool_result_error",
+		ErrorCode: errorCode,
+	})
+	if err != nil {
+		content = []byte(`{"type":"web_search_tool_result_error","error_code":"unavailable"}`)
+	}
+	return models.ContentBlock{
+		Type:      "web_search_tool_result",
+		ToolUseID: callID,
+		Content:   content,
+	}
 }
 
 func webSearchResultHost(rawURL string) string {

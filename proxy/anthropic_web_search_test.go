@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -1041,5 +1042,136 @@ func TestFilterWebSearchResultsNormalizesTrailingDotHosts(t *testing.T) {
 	}
 	if filtered[0].URL != "https://example.com./trailing-dot-allowed" {
 		t.Fatalf("filtered = %#v, want only the trailing-dot allowed host to survive", filtered)
+	}
+}
+
+func TestNewWebSearchCallIDShape(t *testing.T) {
+	seen := map[string]struct{}{}
+	for i := 0; i < 64; i++ {
+		id := newWebSearchCallID()
+		if !strings.HasPrefix(id, webSearchCallIDPrefix) {
+			t.Fatalf("call id %q lacks prefix %q", id, webSearchCallIDPrefix)
+		}
+		suffix := strings.TrimPrefix(id, webSearchCallIDPrefix)
+		if len(suffix) != 22 {
+			t.Fatalf("call id suffix %q has length %d, want 22", suffix, len(suffix))
+		}
+		if _, err := base64.RawURLEncoding.DecodeString(suffix); err != nil {
+			t.Fatalf("call id suffix %q is not base64url: %v", suffix, err)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			t.Fatalf("call id %q was generated twice", id)
+		}
+		seen[id] = struct{}{}
+	}
+}
+
+func TestWebSearchContentRoundTripsAndFailsClosed(t *testing.T) {
+	original := webSearchResult{URL: "https://example.com/a", Title: "A", Snippet: "some text", PageAge: "2 days ago"}
+	encoded := encodeWebSearchContent(original)
+	if !strings.HasPrefix(encoded, webSearchContentVersion) {
+		t.Fatalf("encoded token %q lacks version prefix %q", encoded, webSearchContentVersion)
+	}
+	decoded, ok := decodeWebSearchContent(encoded)
+	if !ok {
+		t.Fatalf("decodeWebSearchContent(%q) failed on a token we minted", encoded)
+	}
+	if decoded != original {
+		t.Fatalf("decoded = %#v, want %#v", decoded, original)
+	}
+
+	payload := strings.TrimPrefix(encoded, webSearchContentVersion)
+	for name, token := range map[string]string{
+		"empty":             "",
+		"missing version":   payload,
+		"wrong version":     "vkws0:" + payload,
+		"bad base64":        webSearchContentVersion + "!!!not-base64!!!",
+		"bad json":          webSearchContentVersion + base64.RawURLEncoding.EncodeToString([]byte("not json")),
+		"oversize":          webSearchContentVersion + strings.Repeat("A", webSearchMaxContentBytes),
+		"plain client text": "just some text the client made up",
+	} {
+		if _, ok := decodeWebSearchContent(token); ok {
+			t.Fatalf("decodeWebSearchContent accepted %s token %q", name, token)
+		}
+	}
+}
+
+func TestEncodeWebSearchContentStaysUnderCap(t *testing.T) {
+	huge := webSearchResult{URL: "https://example.com/a", Title: "A", Snippet: strings.Repeat("x", 4*webSearchMaxContentBytes)}
+	encoded := encodeWebSearchContent(huge)
+	if len(encoded) > webSearchMaxContentBytes {
+		t.Fatalf("len(encoded) = %d, want <= %d", len(encoded), webSearchMaxContentBytes)
+	}
+	decoded, ok := decodeWebSearchContent(encoded)
+	if !ok {
+		t.Fatalf("size-capped token did not decode: %q", encoded)
+	}
+	if decoded.URL != huge.URL || decoded.Title != huge.Title {
+		t.Fatalf("size-capped token lost identity fields: %#v", decoded)
+	}
+}
+
+func TestSynthesizeWebSearchBlocksShapes(t *testing.T) {
+	callID := newWebSearchCallID()
+	results := []webSearchResult{
+		{URL: "https://example.com/a", Title: "A", Snippet: "first", PageAge: "2 days ago"},
+		{URL: "https://example.com/b", Title: "B", Snippet: "second"},
+	}
+
+	use, result := synthesizeWebSearchBlocks(callID, "seattle weather", results)
+	if use.Type != "server_tool_use" || use.ID != callID || use.Name != anthropicWebSearchToolName {
+		t.Fatalf("server_tool_use block = %#v", use)
+	}
+	var input struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(use.Input, &input); err != nil || input.Query != "seattle weather" {
+		t.Fatalf("server_tool_use input = %s (err %v)", use.Input, err)
+	}
+
+	if result.Type != "web_search_tool_result" || result.ToolUseID != callID {
+		t.Fatalf("web_search_tool_result block = %#v", result)
+	}
+	var items []struct {
+		Type             string `json:"type"`
+		URL              string `json:"url"`
+		Title            string `json:"title"`
+		EncryptedContent string `json:"encrypted_content"`
+		PageAge          string `json:"page_age"`
+	}
+	if err := json.Unmarshal(result.Content, &items); err != nil {
+		t.Fatalf("success content must be a JSON list: %v (%s)", err, result.Content)
+	}
+	if len(items) != 2 {
+		t.Fatalf("len(items) = %d, want 2", len(items))
+	}
+	if items[0].Type != "web_search_result" || items[0].URL != "https://example.com/a" || items[0].PageAge != "2 days ago" {
+		t.Fatalf("items[0] = %#v", items[0])
+	}
+	roundTripped, ok := decodeWebSearchContent(items[1].EncryptedContent)
+	if !ok || roundTripped.Snippet != "second" {
+		t.Fatalf("items[1].encrypted_content did not round trip: %#v (ok=%v)", roundTripped, ok)
+	}
+}
+
+func TestWebSearchErrorResultBlockIsSingleObject(t *testing.T) {
+	callID := newWebSearchCallID()
+	block := webSearchErrorResultBlock(callID, "max_uses_exceeded")
+	if block.Type != "web_search_tool_result" || block.ToolUseID != callID {
+		t.Fatalf("error block = %#v", block)
+	}
+	var list []json.RawMessage
+	if err := json.Unmarshal(block.Content, &list); err == nil {
+		t.Fatalf("error content decoded as a list, must be a single object: %s", block.Content)
+	}
+	var object struct {
+		Type      string `json:"type"`
+		ErrorCode string `json:"error_code"`
+	}
+	if err := json.Unmarshal(block.Content, &object); err != nil {
+		t.Fatalf("error content is not a JSON object: %v (%s)", err, block.Content)
+	}
+	if object.Type != "web_search_tool_result_error" || object.ErrorCode != "max_uses_exceeded" {
+		t.Fatalf("error content = %s", block.Content)
 	}
 }
