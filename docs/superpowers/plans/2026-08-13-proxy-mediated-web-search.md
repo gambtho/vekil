@@ -249,7 +249,9 @@ func TestClientDefinesWebSearchTool(t *testing.T) {
 			tools: []models.AnthropicTool{
 				{Type: "custom", Name: "web_search"},
 			},
-			want: false,
+			// "custom" is a client tool per isAnthropicClientTool, so it must
+			// trip the ambiguity guard exactly like an untyped one.
+			want: true,
 		},
 		{
 			name:  "unrelated client tool",
@@ -403,10 +405,14 @@ func hostedWebSearchTool(tools []models.AnthropicTool) (models.AnthropicTool, in
 
 // clientDefinesWebSearchTool reports whether the client declared its own tool
 // named web_search. Mediation declines in that case rather than inventing a
-// renaming scheme to disambiguate the intercepted call.
+// renaming scheme to disambiguate the intercepted call. Client tools are those
+// isAnthropicClientTool accepts — no type, or an explicit "custom" — so the two
+// functions must agree on what a client tool is; a request carrying both a
+// hosted web_search and a "custom"-typed web_search would otherwise slip past
+// this guard and enter mediation with two identically named tools.
 func clientDefinesWebSearchTool(tools []models.AnthropicTool) bool {
 	for _, tool := range tools {
-		if strings.TrimSpace(tool.Type) != "" {
+		if !isAnthropicClientTool(tool) {
 			continue
 		}
 		if tool.Name == anthropicWebSearchToolName {
@@ -1862,6 +1868,28 @@ func TestWebSearchMediationForRejectsConfiguredDelegateOnAnotherProvider(t *test
 	}
 }
 
+func TestWebSearchMediationForRejectsConfiguredDelegateWithoutResponses(t *testing.T) {
+	cfg := webSearchTestEnabledConfig()
+	cfg.DelegateModel = "claude-messages-only"
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, "https://copilot.invalid")
+	h := webSearchTestHandler(t, cfg, webSearchTestCatalog{
+		provider: copilot,
+		models: []providerModel{
+			{publicID: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "claude-messages-only", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+		},
+	})
+
+	// A pinned delegate that cannot serve /responses must decline outright rather
+	// than silently fall through to an auto-discovered one: honoring the pin
+	// would activate mediation and then fail every search, and falling through
+	// would ignore an explicit operator choice.
+	if _, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool())); ok {
+		t.Fatal("webSearchMediationFor() honored a configured delegate that does not advertise /responses")
+	}
+}
+
 func TestWebSearchMediationForDeclinesWhenDisabledOrAmbiguous(t *testing.T) {
 	catalog := func() webSearchTestCatalog {
 		return webSearchTestCatalog{
@@ -1969,9 +1997,17 @@ func (h *ProxyHandler) webSearchDelegateModel(provider *providerRuntime) (provid
 
 	if configured := strings.TrimSpace(h.webSearch.DelegateModel); configured != "" {
 		for _, candidate := range candidates {
-			if candidate.publicID == configured && !candidate.disabled {
-				return candidate, true
+			if candidate.publicID != configured || candidate.disabled {
+				continue
 			}
+			// A pinned delegate must advertise /responses just like a discovered
+			// one. Without this check a Messages-only pin activates mediation and
+			// then fails every search, costing a wasted upstream call per turn
+			// with no error explaining why.
+			if !supportsEndpoint(candidate.supportedEndpoints, providerEndpointResponses) {
+				return providerModel{}, false
+			}
+			return candidate, true
 		}
 		// A configured delegate owned by another provider is a decline, never a
 		// cross-provider fallback.
@@ -2245,7 +2281,7 @@ func TestDelegateWebSearchPinsRequestAndPostFiltersResults(t *testing.T) {
 
 	cfg := webSearchTestEnabledConfig()
 	cfg.MaxResults = 1
-	summary := NewRequestSummary()
+	_, summary := WithRequestSummary(context.Background())
 	mediation := &webSearchMediation{
 		cfg:         cfg,
 		provider:    copilot,
@@ -2282,8 +2318,8 @@ func TestDelegateWebSearchPinsRequestAndPostFiltersResults(t *testing.T) {
 	if mediation.delegatedUsage.InputTokens != 280 || mediation.delegatedUsage.OutputTokens != 120 {
 		t.Fatalf("delegatedUsage is not additive across calls: %#v", mediation.delegatedUsage)
 	}
-	if got := summary.Snapshot().UpstreamSends; got != 2 {
-		t.Fatalf("summary.UpstreamSends = %d, want 2 (one per delegated dispatch)", got)
+	if got := summary.UpstreamSendCount(); got != 2 {
+		t.Fatalf("summary.UpstreamSendCount() = %d, want 2 (one per delegated dispatch)", got)
 	}
 
 	var request struct {
@@ -2404,7 +2440,7 @@ func TestFilterWebSearchResultsIsAuthoritative(t *testing.T) {
 
 Test imports add: `"context"`, `"net/http/httptest"`, `"strings"`.
 
-If `NewRequestSummary` / `Snapshot().UpstreamSends` do not match the exported surface in `proxy/request_summary.go`, use the constructor and snapshot field that file actually provides; the assertion is "one recorded upstream send per delegated dispatch", not a specific accessor name.
+The request-summary API used here is verified: `WithRequestSummary(ctx) (context.Context, *RequestSummary)` (`proxy/request_summary.go:79`) and `(*RequestSummary).UpstreamSendCount() int64` (`:384`). There is no `NewRequestSummary` and no `Snapshot()`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -2490,6 +2526,13 @@ func (h *ProxyHandler) delegateWebSearch(ctx context.Context, m *webSearchMediat
 	if err != nil {
 		return nil, fmt.Errorf("web search delegate send: %w", err)
 	}
+	// This dispatch never passes through the route executor, so nothing else
+	// counts it. Record it here, immediately: singleInferenceSend has already
+	// performed the HTTP request by the time it returns a response, and the
+	// counter represents physical sends. Recording it further down would drop
+	// non-200s, oversized bodies and read failures from upstream_sends —
+	// precisely the traffic someone debugging this would be looking for.
+	m.summary.RecordUpstreamSend()
 	defer drainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("web search delegate returned HTTP %d", resp.StatusCode)
@@ -2502,10 +2545,6 @@ func (h *ProxyHandler) delegateWebSearch(ctx context.Context, m *webSearchMediat
 		return nil, fmt.Errorf("web search delegate response exceeds %d bytes", webSearchMaxResponseBytes)
 	}
 
-	// This dispatch never passes through the route executor, so nothing else
-	// counts it. Record it before parsing: the request was physically sent
-	// whether or not its payload turns out to be usable.
-	m.summary.RecordUpstreamSend()
 	m.delegatedUsage.add(parseWebSearchDelegateUsage(raw))
 
 	results, err := parseWebSearchResults(webSearchDelegateOutputText(raw))
