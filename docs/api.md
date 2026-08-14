@@ -14,6 +14,8 @@ The native-Chat path supports the existing text/image/tool-use subset, system me
 
 Model normalization strips dated suffixes such as `claude-sonnet-4-20250514` and maps hyphenated version numbers to dotted form, for example `claude-sonnet-4-5` to `claude-sonnet-4.5`.
 
+Anthropic's hosted `web_search` server tool is not natively served by every provider. With the optional [`web_search`](web-search.md) block enabled, Vekil mediates the tool for `claude-*` models routed to Copilot: it rewrites the hosted entry into a plain function tool, resolves searches through internal `/responses` calls on the same provider, and returns `server_tool_use` and `web_search_tool_result` blocks with `usage.server_tool_use.web_search_requests` counting delegated calls. Streaming clients receive a replay of the finished message. When the block is disabled or mediation declines to engage, the hosted tool is forwarded verbatim and the provider's own acceptance or rejection stands. `/v1/messages/count_tokens` keeps working either way, but it is not untouched: on the translated path it substitutes the stand-in function tool and decodes replayed `server_tool_use` / `web_search_tool_result` blocks back into plain `tool_use` / `tool_result`. That decode is not gated on `web_search.enabled`, because a history can carry blocks synthesized in an earlier session.
+
 ## `POST /v1/messages/count_tokens` (Anthropic)
 
 Schema-v2 policy public IDs translate count-token input to the canonical Chat probe, select the policy terminal under the active mode, suppress normal traffic statistics for the probe, and return the selected upstream's reported prompt-token usage.

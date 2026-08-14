@@ -69,8 +69,16 @@ func TranslateAnthropicToOpenAI(req *models.AnthropicRequest) (*models.OpenAIReq
 	}
 	oaiReq.Messages = mergeSplitAnthropicReplayAssistantTurns(oaiReq.Messages)
 
-	// Tools
-	for _, t := range req.Tools {
+	// Tools. Anthropic's hosted server tools (web_search_*, web_fetch_*, bash_*,
+	// …) are declared by type alone and carry no input schema — whether Anthropic
+	// runs them or the client does. Translating one would emit a function tool
+	// with no parameters that nothing can ever answer, so reject it with an
+	// index the caller can act on instead. Callers that have a meaningful
+	// stand-in — the count_tokens probe — substitute before calling in.
+	for index, t := range req.Tools {
+		if !isAnthropicClientTool(t) {
+			return nil, fmt.Errorf("tools[%d]: hosted server tool type %q is not supported for this model", index, t.Type)
+		}
 		oaiReq.Tools = append(oaiReq.Tools, models.OpenAITool{
 			Type: "function",
 			Function: models.OpenAIFunction{

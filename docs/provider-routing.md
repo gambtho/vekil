@@ -269,6 +269,10 @@ This is served compatibility, not native capability metadata. Keep `models[].end
 
 On an unknown model routed to an unfiltered dynamic provider, the first Chat-compatible request may perform one provider-local model refresh before choosing a backend. Discovery is coalesced per provider, bounded to two seconds, cached for five minutes after success, and backed off for five seconds after failure. It does not require or populate the merged public `/v1/models` cache.
 
+#### Mediated Anthropic web search
+
+Mediated `web_search` turns (see [Web Search](web-search.md)) run on the same pinned target that served the opening turn and draw on a separate mediated send counter, so they never consume the route's `max_upstream_sends`. That budget stays reserved for the passthrough fallback, which re-issues the original client body whenever mediation fails. Failover across targets mid-loop is not supported, because a target change would invalidate the accumulated conversation state.
+
 ### Azure-Only Example
 
 ```yaml

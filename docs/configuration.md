@@ -16,6 +16,7 @@ Schema version 2 is the complete explicit-routing format: it supports public and
 | Schema-v2 semantic policy profiles, privacy/trust acknowledgements, and rollout gates | [Semantic Policy Routing](policy-routing.md) |
 | Provider console links and API-key setup patterns | [Provider API Keys](provider-api-keys.md) |
 | Optional shell command rewrite and tool-output reduction config | [Tool Optimizers](tool-optimizers.md) |
+| Optional proxy-mediated Anthropic `web_search` | [Web Search](web-search.md) |
 | Codex-style `GET /v1/responses` websocket bridge and compaction tuning | [Responses WebSocket Bridge](responses-websocket.md) |
 
 ## Generic Flags
@@ -56,6 +57,7 @@ Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership 
 - See [Semantic Policy Routing](policy-routing.md) for the schema-v2 `exposure`, `policy_profiles`, provider trust metadata, and classifier data-policy contract. A complete example is checked in at [`examples/policy-routing-coding-economy.yaml`](../examples/policy-routing-coding-economy.yaml).
 - See [Provider API Keys](provider-api-keys.md) for provider console links and key-to-config mapping.
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
+- See [Web Search](web-search.md) for the optional `web_search` block that can live alongside `providers` in the same config file. It is disabled by default.
 - Set the optional top-level `insight_model` key to a public model ID the config serves to enable the dashboard's AI insights button. See [Traffic Dashboard](dashboard.md#ai-insights-optional).
 
 ## Config validation

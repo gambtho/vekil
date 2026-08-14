@@ -1,0 +1,1321 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/sozercan/vekil/logger"
+	"github.com/sozercan/vekil/models"
+)
+
+// webSearchLogEndpoint labels every debug line emitted by the mediated path so
+// internal traffic is never confused with the client's own /v1/messages turn.
+const webSearchLogEndpoint = "messages/web_search/internal"
+
+// forwardAnthropicMessagesWebSearch serves one mediated /v1/messages turn. It
+// returns true only when the client response has been written. Every false
+// return happens before markExplicitRouteDownstreamCommitment, so the caller can
+// always re-issue the ORIGINAL body through the normal passthrough and the
+// client sees exactly what it would have seen with the feature disabled.
+//
+// In production this runs with a NIL route operation: mediation only activates
+// for Copilot-owned conversation models, and providerKindSupportsExplicitEndpoint
+// refuses /v1/messages for Copilot targets, so withExplicitRouteOperation always
+// resolves a legacy route here. Every route-operation touch below is nil-safe.
+func (h *ProxyHandler) forwardAnthropicMessagesWebSearch(w http.ResponseWriter, r *http.Request, body []byte, req *models.AnthropicRequest, m *webSearchMediation) bool {
+	if h == nil || req == nil || m == nil {
+		return false
+	}
+	skip := func(reason string, err error) bool {
+		fields := []logger.Field{
+			logger.F("endpoint", webSearchLogEndpoint),
+			logger.F("reason", reason),
+			logger.F("model", req.Model),
+		}
+		if err != nil {
+			fields = append(fields, logger.Err(err))
+		}
+		h.log.Debug("web search mediation fell back to passthrough", fields...)
+		return false
+	}
+
+	decoded, err := decodeReplayedWebSearchBlocks(body)
+	if err != nil {
+		return skip("replay_decode_failed", err)
+	}
+	rewritten, err := rewriteAnthropicWebSearchRequest(decoded, m)
+	if err != nil {
+		return skip("request_rewrite_failed", err)
+	}
+
+	// Internal spend is flushed on a context that survives client cancellation so
+	// delegated and continuation tokens are never lost to a disconnect.
+	usageCtx := context.WithoutCancel(r.Context())
+	defer h.flushWebSearchInternalUsage(usageCtx, m)
+
+	publicModel, _ := h.directAnthropicResponseModels(req)
+	upstreamCtx, upstreamCancel := h.newInferenceUpstreamContextFrom(r.Context(), false)
+	defer upstreamCancel()
+	upstreamCtx = withRouteOperation(upstreamCtx, routeOperationFromContext(r.Context()))
+	upstreamCtx, routeOperation, route, err := h.withExplicitRouteOperation(upstreamCtx, r.Context(), publicModel, providerEndpointMessages)
+	if err != nil {
+		return skip("route_operation_failed", err)
+	}
+	if routeOperation != nil {
+		w.Header().Set("X-Vekil-Request-ID", routeOperation.operationID())
+	}
+	m.extraHeaders = anthropicExtraHeadersFromRequest(r)
+	m.publicModel = explicitRoutePublicModel(route, publicModel)
+	m.summary = RequestSummaryFromContext(r.Context())
+
+	message, err := h.runWebSearchLoop(upstreamCtx, rewritten, m)
+	if err != nil {
+		return skip("mediated_turn_failed", err)
+	}
+	message.Model = m.publicModel
+
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		return skip("response_encode_failed", err)
+	}
+	observeAnthropicUsageBody(r.Context(), encoded)
+
+	// Past this point the turn is committed downstream and fallback is forbidden.
+	markExplicitRouteDownstreamCommitment(upstreamCtx, downstreamCommitmentSemantic)
+	// Match the direct path (writeDirectAnthropicJSONResponse) and hand the client
+	// the upstream's passthrough headers. The body is always re-marshaled here, so
+	// the upstream Content-Length never applies; the SSE branch resets
+	// Content-Type itself via setSSEHeaders.
+	copyMediatedWebSearchPassthroughHeaders(w, m.finalHeaders)
+	if req.Stream {
+		if err := writeAnthropicMessageAsSSE(w, message); err != nil {
+			h.log.Error("web search SSE replay failed",
+				logger.F("endpoint", webSearchLogEndpoint),
+				logger.F("reason", "sse_replay_write_failed"),
+				logger.Err(err),
+			)
+		}
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(encoded); err != nil {
+		h.log.Error("web search response write failed",
+			logger.F("endpoint", webSearchLogEndpoint),
+			logger.F("reason", "response_write_failed"),
+			logger.Err(err),
+		)
+	}
+	return true
+}
+
+// copyMediatedWebSearchPassthroughHeaders mirrors the direct path's header
+// handling for a mediated turn. Content-Length is always dropped because the
+// emitted body is re-marshaled from decoded blocks and never matches the
+// upstream turn's length.
+func copyMediatedWebSearchPassthroughHeaders(w http.ResponseWriter, upstream http.Header) {
+	if w == nil || len(upstream) == 0 {
+		return
+	}
+	copyPassthroughHeaders(w.Header(), upstream)
+	w.Header().Del("Content-Length")
+}
+
+// flushWebSearchInternalUsage books non-final loop turns and delegated /responses
+// spend additively. The emitted turn's own usage rides on the response body and
+// is observed separately, matching the direct path (upstream_http.go:734).
+func (h *ProxyHandler) flushWebSearchInternalUsage(ctx context.Context, m *webSearchMediation) {
+	if m == nil {
+		return
+	}
+	total := responsesUsage{
+		InputTokens: m.continuationUsage.InputTokens +
+			m.continuationUsage.CacheReadInputTokens +
+			m.continuationUsage.CacheCreationInputTokens +
+			m.delegatedUsage.InputTokens,
+		OutputTokens: m.continuationUsage.OutputTokens + m.delegatedUsage.OutputTokens,
+	}
+	total.TotalTokens = total.InputTokens + total.OutputTokens
+	observeInternalResponsesUsage(ctx, total)
+}
+
+const (
+	// anthropicWebSearchToolName is the tool name Anthropic uses for both the
+	// hosted server tool and the client-side stand-in the proxy substitutes for
+	// it when mediating searches.
+	anthropicWebSearchToolName = "web_search"
+
+	// anthropicHostedWebSearchTypePrefix matches Anthropic's versioned hosted
+	// search tool types (web_search_20250305 and successors). The bare name
+	// "web_search" is deliberately not a hosted type: an unversioned type is not
+	// a shape Anthropic emits, and treating it as hosted would misclassify a
+	// client tool.
+	anthropicHostedWebSearchTypePrefix = "web_search_"
+
+	// anthropicClientToolType is the explicit type Anthropic allows on a
+	// client-defined tool. An omitted type means the same thing.
+	anthropicClientToolType = "custom"
+)
+
+// hostedWebSearchTool returns the first hosted web-search tool in tools along
+// with its index, or false when the request carries none.
+func hostedWebSearchTool(tools []models.AnthropicTool) (models.AnthropicTool, int, bool) {
+	for index, tool := range tools {
+		if strings.HasPrefix(strings.TrimSpace(tool.Type), anthropicHostedWebSearchTypePrefix) {
+			return tool, index, true
+		}
+	}
+	return models.AnthropicTool{}, -1, false
+}
+
+// clientDefinesWebSearchTool reports whether the client declared its own tool
+// named web_search. Mediation declines in that case rather than inventing a
+// renaming scheme to disambiguate the intercepted call. Client tools are those
+// isAnthropicClientTool accepts — no type, or an explicit "custom" — so the two
+// functions must agree on what a client tool is; a request carrying both a
+// hosted web_search and a "custom"-typed web_search would otherwise slip past
+// this guard and enter mediation with two identically named tools.
+func clientDefinesWebSearchTool(tools []models.AnthropicTool) bool {
+	for _, tool := range tools {
+		if !isAnthropicClientTool(tool) {
+			continue
+		}
+		if tool.Name == anthropicWebSearchToolName {
+			return true
+		}
+	}
+	return false
+}
+
+// isAnthropicClientTool reports whether a tool is one the client itself will
+// answer. Anthropic marks those with no type or with "custom"; every other type
+// names a hosted server tool that the upstream, not the client, executes.
+func isAnthropicClientTool(tool models.AnthropicTool) bool {
+	toolType := strings.TrimSpace(tool.Type)
+	return toolType == "" || strings.EqualFold(toolType, anthropicClientToolType)
+}
+
+// webSearchStandInInputSchema is the client-tool schema that replaces
+// Anthropic's hosted web_search tool. Mediation sends exactly this shape
+// upstream, so anything that reasons about the mediated request — token
+// counting included — must use exactly this shape too.
+const webSearchStandInInputSchema = `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`
+
+// webSearchStandInTool is the client tool the proxy substitutes for Anthropic's
+// hosted web_search server tool.
+func webSearchStandInTool() models.AnthropicTool {
+	return models.AnthropicTool{
+		Name:        anthropicWebSearchToolName,
+		InputSchema: json.RawMessage(webSearchStandInInputSchema),
+	}
+}
+
+// translateAnthropicToolsForTokenCount replaces hosted web_search tools with the
+// stand-in the proxy actually sends upstream, so /v1/messages/count_tokens keeps
+// working for clients that declare the hosted tool and reports the count for the
+// tool the model will really be given. Other hosted types have no stand-in and
+// are left in place for TranslateAnthropicToOpenAI to reject. The input slice is
+// never mutated; the second result reports whether a copy was made.
+func translateAnthropicToolsForTokenCount(tools []models.AnthropicTool) ([]models.AnthropicTool, bool) {
+	out := tools
+	substituted := false
+	for index, tool := range tools {
+		if !strings.HasPrefix(strings.TrimSpace(tool.Type), anthropicHostedWebSearchTypePrefix) {
+			continue
+		}
+		if !substituted {
+			out = make([]models.AnthropicTool, len(tools))
+			copy(out, tools)
+			substituted = true
+		}
+		out[index] = webSearchStandInTool()
+	}
+	return out, substituted
+}
+
+// webSearchMediation is the resolved, immutable decision to mediate one
+// Anthropic /v1/messages turn. Everything the client asked for that must not
+// reach the upstream (max_uses and the domain/location filters) lives on tool
+// and is applied proxy-side instead.
+type webSearchMediation struct {
+	cfg         WebSearchConfig
+	tool        models.AnthropicTool
+	delegate    providerModel
+	provider    *providerRuntime
+	maxSearches int
+	// summary counts physical dispatches so upstream_sends stays honest;
+	// singleInferenceSend bypasses the route executor's RecordUpstreamAttempt.
+	summary *RequestSummary
+	// delegatedUsage accumulates internal Responses spend across the turn so
+	// Task 12 can flush it additively instead of clobbering the turn's usage.
+	delegatedUsage responsesUsage
+	// extraHeaders and publicModel are the client headers and public model used
+	// for every mediated dispatch of this turn.
+	extraHeaders http.Header
+	publicModel  string
+	// delegatedCalls and continuationUsage are loop-owned counters: the number
+	// of searches actually delegated, and the token usage of every mediated turn
+	// except the final one whose usage is emitted directly.
+	delegatedCalls    int
+	continuationUsage models.AnthropicUsage
+	// finalHeaders are the upstream response headers of the turn whose message is
+	// emitted to the client. The mediated success path copies them so passthrough
+	// headers the direct path preserves — anthropic-ratelimit-* above all — are
+	// not lost just because the turn was mediated.
+	finalHeaders http.Header
+}
+
+// webSearchMediationFor decides whether this request is eligible for
+// proxy-mediated web search. Every miss is a silent decline: the caller keeps
+// today's byte-for-byte passthrough.
+func (h *ProxyHandler) webSearchMediationFor(req *models.AnthropicRequest) (*webSearchMediation, bool) {
+	if h == nil || req == nil || !h.webSearch.Enabled {
+		return nil, false
+	}
+	tool, _, ok := hostedWebSearchTool(req.Tools)
+	if !ok {
+		return nil, false
+	}
+	// A client tool of the same name would make the intercepted call ambiguous.
+	if clientDefinesWebSearchTool(req.Tools) {
+		return nil, false
+	}
+	provider, _, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	// Hard exclusion, not an optimization: providerTypeAnthropicCompatible also
+	// takes the direct path and already serves hosted web_search natively.
+	// Mediating there would replace a working path with an approximation.
+	if provider == nil || !known || provider.kind != providerTypeCopilot {
+		return nil, false
+	}
+	delegate, ok := h.webSearchDelegateModel(provider)
+	if !ok {
+		return nil, false
+	}
+
+	maxSearches := h.webSearch.MaxSearches
+	if tool.MaxUses != nil && *tool.MaxUses < maxSearches {
+		maxSearches = *tool.MaxUses
+	}
+	if maxSearches <= 0 {
+		return nil, false
+	}
+	return &webSearchMediation{
+		cfg:         h.webSearch,
+		tool:        tool,
+		delegate:    delegate,
+		provider:    provider,
+		maxSearches: maxSearches,
+	}, true
+}
+
+// webSearchDelegateModel picks the model that runs the hosted search. It is
+// constrained to provider — a privacy boundary, not just a correctness one:
+// search queries must not leave the provider the client is already talking to.
+func (h *ProxyHandler) webSearchDelegateModel(provider *providerRuntime) (providerModel, bool) {
+	if h == nil || provider == nil {
+		return providerModel{}, false
+	}
+	candidates := h.providerSetup().modelsForProvider(provider.id)
+	// modelsForProvider walks a map, so order is not stable across calls.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].publicID < candidates[j].publicID })
+
+	if configured := strings.TrimSpace(h.webSearch.DelegateModel); configured != "" {
+		for _, candidate := range candidates {
+			if candidate.publicID != configured || candidate.disabled {
+				continue
+			}
+			// A pinned delegate must advertise /responses just like a discovered
+			// one. Without this check a Messages-only pin activates mediation and
+			// then fails every search, costing a wasted upstream call per turn
+			// with no error explaining why.
+			if !supportsEndpoint(candidate.supportedEndpoints, providerEndpointResponses) {
+				return providerModel{}, false
+			}
+			return candidate, true
+		}
+		// A configured delegate owned by another provider is a decline, never a
+		// cross-provider fallback.
+		return providerModel{}, false
+	}
+	for _, candidate := range candidates {
+		if candidate.disabled {
+			continue
+		}
+		// Explicit advertisement only: supportsEndpoint is false for an empty
+		// endpoint list, so unknown models are never guessed into delegation.
+		if supportsEndpoint(candidate.supportedEndpoints, providerEndpointResponses) {
+			return candidate, true
+		}
+	}
+	return providerModel{}, false
+}
+
+// anthropicWebSearchClientToolJSON is the degenerate client tool the upstream
+// sees in place of the hosted entry. It carries no filters: max_uses,
+// allowed_domains, blocked_domains and user_location are held proxy-side and
+// applied to the results instead.
+const anthropicWebSearchClientToolJSON = `{"name":"web_search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}`
+
+// rewriteAnthropicWebSearchRequest swaps the hosted tool for a plain client
+// tool and forces non-streaming, operating on the raw body so unknown
+// top-level and per-tool fields survive untouched. Key order within the object
+// is not preserved (encoding/json sorts map keys); field content is.
+func rewriteAnthropicWebSearchRequest(body []byte, m *webSearchMediation) ([]byte, error) {
+	if m == nil {
+		return nil, fmt.Errorf("web search mediation is required")
+	}
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, fmt.Errorf("decode messages request: %w", err)
+	}
+	rawTools, ok := request["tools"]
+	if !ok {
+		return nil, fmt.Errorf("messages request carries no tools")
+	}
+	var rawToolEntries []json.RawMessage
+	if err := json.Unmarshal(rawTools, &rawToolEntries); err != nil {
+		return nil, fmt.Errorf("decode tools: %w", err)
+	}
+	// Re-derive the index from the raw array with the same detector used at
+	// activation, so detection has exactly one implementation.
+	decodedTools := make([]models.AnthropicTool, len(rawToolEntries))
+	if err := json.Unmarshal(rawTools, &decodedTools); err != nil {
+		return nil, fmt.Errorf("decode tools: %w", err)
+	}
+	_, index, found := hostedWebSearchTool(decodedTools)
+	if !found || index < 0 || index >= len(rawToolEntries) {
+		return nil, fmt.Errorf("messages request carries no hosted %s tool", anthropicWebSearchToolName)
+	}
+
+	rewrittenTools := make([]json.RawMessage, len(rawToolEntries))
+	copy(rewrittenTools, rawToolEntries)
+	rewrittenTools[index] = json.RawMessage(anthropicWebSearchClientToolJSON)
+
+	encodedTools, err := json.Marshal(rewrittenTools)
+	if err != nil {
+		return nil, fmt.Errorf("encode tools: %w", err)
+	}
+	request["tools"] = encodedTools
+	// The client's own stream value is remembered by the caller for emission;
+	// upstream is always non-streaming so fallback stays available.
+	request["stream"] = json.RawMessage("false")
+
+	rewritten, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("encode messages request: %w", err)
+	}
+	return rewritten, nil
+}
+
+// webSearchMaxResponseBytes bounds a delegated /responses body, mirroring the
+// policy classifier's policyClassifierResponseLimit (proxy/policy_routing.go:18)
+// while staying independently tunable.
+const webSearchMaxResponseBytes = 64 << 10
+
+// webSearchDelegateInstruction is load-bearing, not decoration: without the
+// single-search and no-refinement constraints one delegated call fans out to a
+// dozen internal searches and latency roughly quadruples.
+const webSearchDelegateInstruction = "You are a search executor, not an assistant. " +
+	"Run exactly ONE web search for the user's query. Do not refine, retry, or run additional searches. " +
+	"Reply with ONLY a JSON array of objects with the keys \"url\", \"title\", \"snippet\" and \"page_age\". " +
+	"Use an empty string for any field you do not know. " +
+	"No prose, no explanation, no markdown fences, no other keys."
+
+// webSearchResult is one post-filtered search hit.
+type webSearchResult struct {
+	URL     string `json:"url"`
+	Title   string `json:"title"`
+	Snippet string `json:"snippet"`
+	PageAge string `json:"page_age"`
+}
+
+// delegateWebSearch performs one internal /responses call on the same provider
+// that owns the conversation. It dispatches through singleInferenceSend so a
+// delegation failure cannot consume the client's route failover budget. Any
+// error means the caller falls back to plain passthrough.
+func (h *ProxyHandler) delegateWebSearch(ctx context.Context, m *webSearchMediation, query string) ([]webSearchResult, error) {
+	if h == nil || m == nil || m.provider == nil {
+		return nil, fmt.Errorf("web search delegation requires a resolved mediation")
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("web search query is empty")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.cfg.TimeoutMS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(m.cfg.TimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
+
+	body, err := buildWebSearchDelegateRequest(m, query)
+	if err != nil {
+		return nil, err
+	}
+	req, err := h.newProviderJSONRequest(ctx, m.provider, http.MethodPost, providerEndpointResponses, body, http.Header{"Content-Type": []string{"application/json"}}, "", m.delegate)
+	if err != nil {
+		return nil, fmt.Errorf("build web search delegate request: %w", err)
+	}
+	resp, err := h.singleInferenceSend(req, newRouteSendObservation(time.Now(), nil))
+	if err != nil {
+		return nil, fmt.Errorf("web search delegate send: %w", err)
+	}
+	// This dispatch never passes through the route executor, so nothing else
+	// counts it. Record it here, immediately: singleInferenceSend has already
+	// performed the HTTP request by the time it returns a response, and the
+	// counter represents physical sends. Recording it further down would drop
+	// non-200s, oversized bodies and read failures from upstream_sends —
+	// precisely the traffic someone debugging this would be looking for.
+	m.summary.RecordUpstreamSend()
+	defer drainAndClose(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("web search delegate returned HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, webSearchMaxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read web search delegate response: %w", err)
+	}
+	if len(raw) > webSearchMaxResponseBytes {
+		return nil, fmt.Errorf("web search delegate response exceeds %d bytes", webSearchMaxResponseBytes)
+	}
+
+	m.delegatedUsage.add(parseWebSearchDelegateUsage(raw))
+
+	results, err := parseWebSearchResults(webSearchDelegateOutputText(raw))
+	if err != nil {
+		return nil, err
+	}
+	// Post-filtering is authoritative regardless of the filters sent upstream:
+	// blocked_domains enforcement on the delegated side is unverified.
+	return filterWebSearchResults(results, m.tool, m.cfg.MaxResults), nil
+}
+
+func parseWebSearchDelegateUsage(body []byte) responsesUsage {
+	var envelope struct {
+		Usage responsesUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return responsesUsage{}
+	}
+	return envelope.Usage
+}
+
+func buildWebSearchDelegateRequest(m *webSearchMediation, query string) ([]byte, error) {
+	upstreamModel := strings.TrimSpace(m.delegate.upstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = strings.TrimSpace(m.delegate.publicID)
+	}
+	if upstreamModel == "" {
+		return nil, fmt.Errorf("web search delegate has no upstream model")
+	}
+
+	tool := map[string]any{"type": anthropicWebSearchToolName}
+	if size := strings.TrimSpace(m.cfg.SearchContextSize); size != "" {
+		tool["search_context_size"] = size
+	}
+	filters := map[string]any{}
+	if len(m.tool.AllowedDomains) > 0 {
+		filters["allowed_domains"] = m.tool.AllowedDomains
+	}
+	if len(m.tool.BlockedDomains) > 0 {
+		filters["blocked_domains"] = m.tool.BlockedDomains
+	}
+	if len(filters) > 0 {
+		tool["filters"] = filters
+	}
+	if len(m.tool.UserLocation) > 0 {
+		tool["user_location"] = m.tool.UserLocation
+	}
+
+	request := map[string]any{
+		"model":     upstreamModel,
+		"stream":    false,
+		"store":     false,
+		"reasoning": map[string]any{"effort": "low"},
+		"tools":     []any{tool},
+		"input": []any{
+			map[string]any{"role": "developer", "content": webSearchDelegateInstruction},
+			map[string]any{"role": "user", "content": query},
+		},
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("encode web search delegate request: %w", err)
+	}
+	return encoded, nil
+}
+
+func webSearchDelegateOutputText(body []byte) string {
+	var envelope struct {
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return ""
+	}
+	if strings.TrimSpace(envelope.OutputText) != "" {
+		return envelope.OutputText
+	}
+	var text strings.Builder
+	for _, item := range envelope.Output {
+		for _, part := range item.Content {
+			if part.Type == "output_text" {
+				text.WriteString(part.Text)
+			}
+		}
+	}
+	return text.String()
+}
+
+func parseWebSearchResults(text string) ([]webSearchResult, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil, fmt.Errorf("web search delegate returned no output text")
+	}
+	// Tolerate a fenced block even though the prompt forbids it.
+	if strings.HasPrefix(trimmed, "```") {
+		trimmed = strings.TrimPrefix(trimmed, "```")
+		trimmed = strings.TrimPrefix(trimmed, "json")
+		if end := strings.LastIndex(trimmed, "```"); end >= 0 {
+			trimmed = trimmed[:end]
+		}
+		trimmed = strings.TrimSpace(trimmed)
+	}
+	var results []webSearchResult
+	if err := json.Unmarshal([]byte(trimmed), &results); err != nil {
+		return nil, fmt.Errorf("web search delegate output is not a JSON result array: %w", err)
+	}
+	return results, nil
+}
+
+// filterWebSearchResults enforces the client's domain filters proxy-side and
+// truncates to maxResults. It is the authoritative filter regardless of what
+// was sent upstream.
+func filterWebSearchResults(results []webSearchResult, tool models.AnthropicTool, maxResults int) []webSearchResult {
+	filtered := make([]webSearchResult, 0, len(results))
+	for _, result := range results {
+		host := webSearchResultHost(result.URL)
+		if host == "" {
+			continue
+		}
+		if webSearchHostMatchesAny(host, tool.BlockedDomains) {
+			continue
+		}
+		if len(tool.AllowedDomains) > 0 && !webSearchHostMatchesAny(host, tool.AllowedDomains) {
+			continue
+		}
+		filtered = append(filtered, result)
+		if maxResults > 0 && len(filtered) >= maxResults {
+			break
+		}
+	}
+	return filtered
+}
+
+const (
+	// webSearchContentVersion prefixes every minted encrypted_content token,
+	// mirroring encodeSyntheticCompaction (proxy/compaction.go:19-25).
+	webSearchContentVersion = "vkws1:"
+	// webSearchMaxContentBytes caps a minted token and rejects an oversize one
+	// on the way back in.
+	webSearchMaxContentBytes = 8192
+	webSearchCallIDPrefix    = "srvtoolu_"
+)
+
+type webSearchResultItem struct {
+	Type             string `json:"type"`
+	URL              string `json:"url"`
+	Title            string `json:"title"`
+	EncryptedContent string `json:"encrypted_content"`
+	PageAge          string `json:"page_age"`
+}
+
+type webSearchResultErrorContent struct {
+	Type      string `json:"type"`
+	ErrorCode string `json:"error_code"`
+}
+
+func newWebSearchCallID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		// crypto/rand failure is fatal for uniqueness; fall back to a
+		// time-derived id rather than emitting a colliding constant.
+		binary.BigEndian.PutUint64(raw[0:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(raw[8:16], uint64(time.Now().UnixNano())^0x9e3779b97f4a7c15)
+	}
+	// 16 random bytes encode to exactly 22 base64url characters.
+	return webSearchCallIDPrefix + base64.RawURLEncoding.EncodeToString(raw[:])
+}
+
+// encodeWebSearchContent mints the stateless token handed to the client as
+// encrypted_content. It is deliberately NOT authenticated encryption: the
+// client already controls the whole message history, so forging one grants no
+// capability it lacks. What matters is that decode is strict.
+func encodeWebSearchContent(r webSearchResult) string {
+	encoded := encodeWebSearchContentOnce(r)
+	for len(encoded) > webSearchMaxContentBytes && len(r.Snippet) > 0 {
+		r.Snippet = truncateUTF8Prefix(r.Snippet, len(r.Snippet)/2)
+		encoded = encodeWebSearchContentOnce(r)
+	}
+	if len(encoded) > webSearchMaxContentBytes {
+		// Identity fields alone still exceed the cap; drop the payload rather
+		// than mint a token that will fail closed on the way back.
+		return ""
+	}
+	return encoded
+}
+
+func encodeWebSearchContentOnce(r webSearchResult) string {
+	payload, err := json.Marshal(r)
+	if err != nil {
+		return ""
+	}
+	return webSearchContentVersion + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+// decodeWebSearchContent fails closed. A wrong or missing version prefix, an
+// oversize token, bad base64 or bad JSON all return ok=false so malformed or
+// forged content is never passed through to the model.
+func decodeWebSearchContent(encoded string) (webSearchResult, bool) {
+	if len(encoded) > webSearchMaxContentBytes {
+		return webSearchResult{}, false
+	}
+	if !strings.HasPrefix(encoded, webSearchContentVersion) {
+		return webSearchResult{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encoded, webSearchContentVersion))
+	if err != nil {
+		return webSearchResult{}, false
+	}
+	var result webSearchResult
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil {
+		return webSearchResult{}, false
+	}
+	if decoder.More() {
+		return webSearchResult{}, false
+	}
+	return result, true
+}
+
+func truncateUTF8Prefix(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if limit >= len(s) {
+		return s
+	}
+	for limit > 0 && !utf8.RuneStart(s[limit]) {
+		limit--
+	}
+	return s[:limit]
+}
+
+// synthesizeWebSearchBlocks builds the pair Anthropic clients expect for a
+// completed server tool call. The success content is a JSON list; the error
+// form (webSearchErrorResultBlock) is a single object. That distinction is
+// load-bearing and must not be conflated.
+func synthesizeWebSearchBlocks(callID, query string, results []webSearchResult) (models.ContentBlock, models.ContentBlock) {
+	input, err := json.Marshal(map[string]string{"query": query})
+	if err != nil {
+		input = []byte(`{"query":""}`)
+	}
+	items := make([]webSearchResultItem, 0, len(results))
+	for _, result := range results {
+		items = append(items, webSearchResultItem{
+			Type:             "web_search_result",
+			URL:              result.URL,
+			Title:            result.Title,
+			EncryptedContent: encodeWebSearchContent(result),
+			PageAge:          result.PageAge,
+		})
+	}
+	content, err := json.Marshal(items)
+	if err != nil {
+		content = []byte("[]")
+	}
+	use := models.ContentBlock{
+		Type:  "server_tool_use",
+		ID:    callID,
+		Name:  anthropicWebSearchToolName,
+		Input: input,
+	}
+	result := models.ContentBlock{
+		Type:      "web_search_tool_result",
+		ToolUseID: callID,
+		Content:   content,
+	}
+	return use, result
+}
+
+func webSearchErrorResultBlock(callID, errorCode string) models.ContentBlock {
+	content, err := json.Marshal(webSearchResultErrorContent{
+		Type:      "web_search_tool_result_error",
+		ErrorCode: errorCode,
+	})
+	if err != nil {
+		content = []byte(`{"type":"web_search_tool_result_error","error_code":"unavailable"}`)
+	}
+	return models.ContentBlock{
+		Type:      "web_search_tool_result",
+		ToolUseID: callID,
+		Content:   content,
+	}
+}
+
+func webSearchResultHost(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" {
+		return ""
+	}
+	// A trailing root-label dot (e.g. "spam.test.") is DNS-equivalent to
+	// "spam.test" and fully resolvable as such, so it must not evade
+	// blocked_domains or fail allowed_domains just by comparing unequal
+	// strings.
+	return strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+}
+
+func webSearchHostMatchesAny(host string, domains []string) bool {
+	for _, domain := range domains {
+		candidate := strings.ToLower(strings.TrimSpace(domain))
+		candidate = strings.TrimPrefix(candidate, "*.")
+		candidate = strings.TrimPrefix(candidate, ".")
+		// Normalize a trailing dot on the configured domain too, so a
+		// blocked_domains/allowed_domains entry authored with a root-label
+		// dot still compares equal to a host without one.
+		candidate = strings.TrimSuffix(candidate, ".")
+		if candidate == "" {
+			continue
+		}
+		if host == candidate || strings.HasSuffix(host, "."+candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// runWebSearchLoop drives bounded mediated turns against one pinned route
+// target. ctx must already carry the route operation for the client's turn.
+// Every dispatch, turn 1 included, is tagged routeAttemptWebSearch so a failure
+// can still fall back through the untouched client budget.
+func (h *ProxyHandler) runWebSearchLoop(ctx context.Context, body []byte, m *webSearchMediation) (*models.AnthropicResponse, error) {
+	if m == nil {
+		return nil, fmt.Errorf("web search mediation is required")
+	}
+	operation := routeOperationFromContext(ctx)
+	// One send per possible search, plus the opening turn and the turn that
+	// consumes the last result set.
+	operation.grantWebSearchSends(m.maxSearches + 2)
+	dispatchCtx := withRouteAttemptKind(ctx, routeAttemptWebSearch)
+
+	var (
+		// Non-nil so an empty mediated turn serializes as "content": [], the shape
+		// passthrough would have produced; ContentBlock has no omitempty.
+		blocks    = make([]models.ContentBlock, 0, 4)
+		pending   *models.AnthropicResponse
+		emitted   bool
+		delegated int
+		remaining = m.maxSearches
+		turn      int
+		override  string
+	)
+	// Every completed turn is internal spend except the one actually emitted to
+	// the client, whose usage rides on the response body. The in-loop call below
+	// books a turn once its successor arrives; this books the last completed turn
+	// when no successor ever does, so a mid-loop failure cannot silently discard
+	// tokens that were really spent.
+	defer func() {
+		if pending != nil && !emitted {
+			addAnthropicUsage(&m.continuationUsage, pending.Usage)
+		}
+	}()
+	for {
+		// The executor soft-pins the target on first success, so from turn 2 on
+		// every mediated dispatch must already be bound to one target. A missing
+		// pin would mean the loop could silently fail over mid-conversation.
+		if turn > 0 && operation != nil && operation.pinnedTarget() == "" {
+			return nil, fmt.Errorf("web search continuation has no pinned route target")
+		}
+		resp, err := h.executeAnthropicMessagesRouteRequest(dispatchCtx, body, m.extraHeaders, false, m.publicModel)
+		if err != nil {
+			return nil, err
+		}
+		// Mediation turns one client request into N upstream requests, so
+		// upstream_sends must see the multiplier. The guard is what makes this
+		// safe both now and later: with no route operation the dispatch is legacy
+		// and nothing else counts it, and when an operation exists the executor's
+		// RecordUpstreamAttempt already did. Exactly one of the two ever fires.
+		// Same reasoning as the delegated /responses send in delegateWebSearch.
+		if operation == nil {
+			m.summary.RecordUpstreamSend()
+		}
+		message, header, err := readMediatedAnthropicMessage(resp)
+		if err != nil {
+			return nil, err
+		}
+		// Only the last turn's headers survive: that is the turn whose message the
+		// client actually receives, and its rate-limit counters are the freshest.
+		m.finalHeaders = header
+		if pending != nil {
+			addAnthropicUsage(&m.continuationUsage, pending.Usage)
+		}
+		pending = message
+		turn++
+
+		searched := false
+		exhausted := false
+		clientToolUse := false
+		toolResults := make([]json.RawMessage, 0, len(message.Content))
+		for _, block := range message.Content {
+			if block.Type != "tool_use" || block.Name != anthropicWebSearchToolName {
+				if block.Type == "tool_use" {
+					clientToolUse = true
+				}
+				blocks = append(blocks, block)
+				continue
+			}
+			searched = true
+			callID := newWebSearchCallID()
+			query := webSearchQueryFromInput(block.Input)
+			if remaining <= 0 {
+				use, _ := synthesizeWebSearchBlocks(callID, query, nil)
+				blocks = append(blocks, use, webSearchErrorResultBlock(callID, "max_uses_exceeded"))
+				// No upstream tool_result is built for an unserved call: exhaustion
+				// ends the loop below, so no continuation turn is ever sent.
+				exhausted = true
+				continue
+			}
+			results, err := h.delegateWebSearch(ctx, m, query)
+			if err != nil {
+				return nil, err
+			}
+			remaining--
+			delegated++
+			use, result := synthesizeWebSearchBlocks(callID, query, results)
+			blocks = append(blocks, use, result)
+			toolResults = append(toolResults, upstreamToolResultJSON(block.ID, webSearchResultsText(results), false))
+		}
+
+		if !searched {
+			break
+		}
+		if clientToolUse {
+			override = "tool_use"
+			break
+		}
+		if exhausted {
+			override = "end_turn"
+			break
+		}
+		body, err = appendWebSearchContinuationTurn(body, message.Content, toolResults)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	final := *pending
+	final.Content = blocks
+	if override != "" {
+		stop := override
+		final.StopReason = &stop
+	}
+	final.Usage = pending.Usage
+	final.Usage.ServerToolUse = &models.AnthropicServerToolUse{WebSearchRequests: delegated}
+	m.delegatedCalls = delegated
+	emitted = true
+	return &final, nil
+}
+
+// readMediatedAnthropicMessage decodes one mediated turn and returns the
+// upstream response headers alongside it, so the emitted turn can carry the
+// same passthrough headers (anthropic-ratelimit-* in particular) that
+// writeDirectAnthropicJSONResponse preserves on the direct path.
+func readMediatedAnthropicMessage(resp *http.Response) (*models.AnthropicResponse, http.Header, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil, fmt.Errorf("upstream response is unavailable")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxLargeRequestBodySize))
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("mediated web search turn returned status %d", resp.StatusCode)
+	}
+	var message models.AnthropicResponse
+	if err := json.Unmarshal(body, &message); err != nil {
+		return nil, nil, fmt.Errorf("decoding mediated web search turn: %w", err)
+	}
+	return &message, resp.Header, nil
+}
+
+func addAnthropicUsage(dst *models.AnthropicUsage, src models.AnthropicUsage) {
+	dst.InputTokens += src.InputTokens
+	dst.OutputTokens += src.OutputTokens
+	dst.CacheReadInputTokens += src.CacheReadInputTokens
+	dst.CacheCreationInputTokens += src.CacheCreationInputTokens
+}
+
+func webSearchQueryFromInput(input json.RawMessage) string {
+	var parsed struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(input, &parsed); err != nil {
+		return ""
+	}
+	return parsed.Query
+}
+
+func webSearchResultsText(results []webSearchResult) string {
+	if len(results) == 0 {
+		return "No results."
+	}
+	var b strings.Builder
+	for i, result := range results {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		fmt.Fprintf(&b, "%s\n%s\n%s", result.Title, result.URL, result.Snippet)
+	}
+	return b.String()
+}
+
+// upstreamToolResultJSON builds the tool_result the upstream sees. It answers
+// the upstream's own tool_use ID; the srvtoolu_ IDs are client-facing only.
+func upstreamToolResultJSON(toolUseID, text string, isError bool) json.RawMessage {
+	encoded, _ := json.Marshal(map[string]any{
+		"type":        "tool_result",
+		"tool_use_id": toolUseID,
+		"is_error":    isError,
+		"content":     []any{map[string]any{"type": "text", "text": text}},
+	})
+	return encoded
+}
+
+func appendWebSearchContinuationTurn(body []byte, assistant []models.ContentBlock, toolResults []json.RawMessage) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	var messages []json.RawMessage
+	if raw, ok := fields["messages"]; ok {
+		if err := json.Unmarshal(raw, &messages); err != nil {
+			return nil, err
+		}
+	}
+	assistantContent, err := json.Marshal(assistant)
+	if err != nil {
+		return nil, err
+	}
+	assistantTurn, err := json.Marshal(models.AnthropicMessage{Role: "assistant", Content: assistantContent})
+	if err != nil {
+		return nil, err
+	}
+	resultContent, err := json.Marshal(toolResults)
+	if err != nil {
+		return nil, err
+	}
+	userTurn, err := json.Marshal(models.AnthropicMessage{Role: "user", Content: resultContent})
+	if err != nil {
+		return nil, err
+	}
+	messages = append(messages, assistantTurn, userTurn)
+	encoded, err := json.Marshal(messages)
+	if err != nil {
+		return nil, err
+	}
+	fields["messages"] = encoded
+	return json.Marshal(fields)
+}
+
+// decodeReplayedWebSearchBlocks converts Vekil-synthesized web_search blocks in
+// an inbound body back into the plain tool_use / tool_result shapes an upstream
+// understands. server_tool_use stays in the assistant turn (converted to
+// tool_use); web_search_tool_result moves into a user turn inserted
+// immediately after it, because a tool_result is not valid assistant content.
+//
+// Block POSITION, not just type, decides the split: anything that sat before
+// the turn's last synthesized result stays in a "pre" assistant message that
+// precedes the inserted tool_result turn; anything that sat after it (for
+// example the model's own answer text, which is causally downstream of the
+// result) moves into a new "post" assistant message inserted after the
+// tool_result turn — mirroring how appendWebSearchContinuationTurn already
+// composes a real continuation. A message can therefore expand into up to
+// three messages: pre-result assistant, result user turn, post-result
+// assistant. Either assistant side is omitted when empty, and a final pass
+// (avoidAdjacentSameRoleAnthropicMessages) guarantees that omission never
+// leaves two adjacent messages sharing a role.
+//
+// Decoding is fail-closed: any token that is not a well-formed Vekil result
+// yields an is_error tool_result, so forged or truncated encrypted_content can
+// never reach the model as trusted text. Bodies with no synthesized blocks are
+// returned byte-for-byte unchanged, and messages whose content decode did not
+// need to touch (including plain-string content) are left exactly as they
+// were unless an adjacency merge requires combining them with a neighbor.
+func decodeReplayedWebSearchBlocks(body []byte) ([]byte, error) {
+	if !bytes.Contains(body, []byte("server_tool_use")) && !bytes.Contains(body, []byte("web_search_tool_result")) {
+		return body, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, err
+	}
+	raw, ok := fields["messages"]
+	if !ok {
+		return body, nil
+	}
+	var messages []models.AnthropicMessage
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		return nil, err
+	}
+	merged, changed, err := decodeReplayedWebSearchMessages(messages)
+	if err != nil {
+		return nil, err
+	}
+	if !changed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return nil, err
+	}
+	fields["messages"] = encoded
+	return json.Marshal(fields)
+}
+
+// decodeReplayedWebSearchMessages performs the message-level rewrite described
+// on decodeReplayedWebSearchBlocks. It is factored out so callers that already
+// hold decoded messages rather than a raw body — the /v1/messages/count_tokens
+// probe, which must translate a mediated history through translator.go — reuse
+// this one authoritative, fail-closed decoder instead of duplicating it.
+//
+// The returned slice is the input slice itself whenever nothing needed
+// converting, so a non-mediated history is never re-encoded.
+func decodeReplayedWebSearchMessages(messages []models.AnthropicMessage) ([]models.AnthropicMessage, bool, error) {
+	if !anthropicMessagesCarryReplayedWebSearchBlocks(messages) {
+		return messages, false, nil
+	}
+
+	rewritten := make([]models.AnthropicMessage, 0, len(messages)+2)
+	changed := false
+	for _, message := range messages {
+		var blocks []models.ContentBlock
+		if err := json.Unmarshal(message.Content, &blocks); err != nil {
+			// Not a block array (plain string, or any other shape): nothing to
+			// convert here, so the message is passed through byte-for-byte.
+			rewritten = append(rewritten, message)
+			continue
+		}
+
+		lastResultIndex := -1
+		for index, block := range blocks {
+			if block.Type == "web_search_tool_result" {
+				lastResultIndex = index
+			}
+		}
+		if lastResultIndex == -1 {
+			// No synthesized result in this turn. A bare server_tool_use with no
+			// matching result should not normally occur, but converting it in
+			// place keeps this branch consistent without splitting the message.
+			turnChanged := false
+			kept := make([]models.ContentBlock, 0, len(blocks))
+			for _, block := range blocks {
+				if block.Type == "server_tool_use" {
+					turnChanged = true
+					block.Type = "tool_use"
+					if strings.TrimSpace(block.Name) == "" {
+						block.Name = anthropicWebSearchToolName
+					}
+				}
+				kept = append(kept, block)
+			}
+			if !turnChanged {
+				rewritten = append(rewritten, message)
+				continue
+			}
+			changed = true
+			keptContent, err := json.Marshal(kept)
+			if err != nil {
+				return nil, false, err
+			}
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: keptContent})
+			continue
+		}
+
+		changed = true
+		pre := make([]models.ContentBlock, 0, lastResultIndex)
+		post := make([]models.ContentBlock, 0, len(blocks)-lastResultIndex)
+		results := make([]json.RawMessage, 0, len(blocks))
+		for index, block := range blocks {
+			switch block.Type {
+			case "server_tool_use":
+				block.Type = "tool_use"
+				if strings.TrimSpace(block.Name) == "" {
+					block.Name = anthropicWebSearchToolName
+				}
+				if index < lastResultIndex {
+					pre = append(pre, block)
+				} else {
+					post = append(post, block)
+				}
+			case "web_search_tool_result":
+				text, ok := decodeReplayedWebSearchResultText(block.Content)
+				results = append(results, upstreamToolResultJSON(block.ToolUseID, text, !ok))
+			default:
+				if index < lastResultIndex {
+					pre = append(pre, block)
+				} else {
+					post = append(post, block)
+				}
+			}
+		}
+
+		if len(pre) > 0 {
+			preContent, err := json.Marshal(pre)
+			if err != nil {
+				return nil, false, err
+			}
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: preContent})
+		}
+		resultContent, err := json.Marshal(results)
+		if err != nil {
+			return nil, false, err
+		}
+		rewritten = append(rewritten, models.AnthropicMessage{Role: "user", Content: resultContent})
+		if len(post) > 0 {
+			postContent, err := json.Marshal(post)
+			if err != nil {
+				return nil, false, err
+			}
+			rewritten = append(rewritten, models.AnthropicMessage{Role: message.Role, Content: postContent})
+		}
+	}
+	if !changed {
+		return messages, false, nil
+	}
+
+	merged, err := avoidAdjacentSameRoleAnthropicMessages(rewritten)
+	if err != nil {
+		return nil, false, err
+	}
+	return merged, true, nil
+}
+
+// anthropicMessagesCarryReplayedWebSearchBlocks is the cheap pre-check that
+// keeps the decoder a true no-op for ordinary histories: it scans the raw
+// content bytes instead of unmarshalling every message. A false positive (the
+// literal appearing inside plain text) only costs the decode pass, which then
+// changes nothing.
+func anthropicMessagesCarryReplayedWebSearchBlocks(messages []models.AnthropicMessage) bool {
+	for _, message := range messages {
+		if bytes.Contains(message.Content, []byte("server_tool_use")) ||
+			bytes.Contains(message.Content, []byte("web_search_tool_result")) {
+			return true
+		}
+	}
+	return false
+}
+
+// avoidAdjacentSameRoleAnthropicMessages merges any two adjacent messages that
+// end up sharing a role after the pre/result/post split above. Anthropic
+// requires alternating roles, and omitting an empty pre- or post-result
+// assistant side (or splitting a floating, call-less result) can otherwise
+// leave the inserted tool_result user turn directly adjacent to an original
+// user message, or two assistant turns directly adjacent to each other. This
+// follows the same merge-adjacent-turns precedent as
+// mergeSplitAnthropicReplayAssistantTurns (proxy/translator.go) rather than
+// inventing a new approach. Only messages that actually end up adjacent
+// through this rewrite are merged; a body with no synthesized blocks never
+// reaches here (see the early return in decodeReplayedWebSearchBlocks), so
+// this never touches an unrelated request.
+func avoidAdjacentSameRoleAnthropicMessages(messages []models.AnthropicMessage) ([]models.AnthropicMessage, error) {
+	if len(messages) < 2 {
+		return messages, nil
+	}
+	merged := make([]models.AnthropicMessage, 0, len(messages))
+	for _, message := range messages {
+		if len(merged) > 0 && merged[len(merged)-1].Role == message.Role {
+			combined, err := mergeAnthropicMessageContents(merged[len(merged)-1].Content, message.Content)
+			if err != nil {
+				return nil, err
+			}
+			merged[len(merged)-1].Content = combined
+			continue
+		}
+		merged = append(merged, message)
+	}
+	return merged, nil
+}
+
+// mergeAnthropicMessageContents concatenates two messages' content in order,
+// tolerating either a plain string or a content-block array on either side. A
+// string side is converted to the equivalent single text block only here,
+// where a merge is actually required to keep roles alternating — never as a
+// blanket normalization of content the rewrite had no reason to touch.
+func mergeAnthropicMessageContents(a, b json.RawMessage) (json.RawMessage, error) {
+	blocksA, err := anthropicContentBlocks(a)
+	if err != nil {
+		return nil, err
+	}
+	blocksB, err := anthropicContentBlocks(b)
+	if err != nil {
+		return nil, err
+	}
+	combined := append(blocksA, blocksB...)
+	return json.Marshal(combined)
+}
+
+// anthropicContentBlocks normalizes one message's content field, which may be
+// a plain string or a content-block array, into a block slice.
+func anthropicContentBlocks(content json.RawMessage) ([]models.ContentBlock, error) {
+	var blocks []models.ContentBlock
+	if err := json.Unmarshal(content, &blocks); err == nil {
+		return blocks, nil
+	}
+	var text string
+	if err := json.Unmarshal(content, &text); err == nil {
+		return []models.ContentBlock{{Type: "text", Text: &text}}, nil
+	}
+	return nil, fmt.Errorf("anthropic message content is neither a block array nor a string")
+}
+
+// decodeReplayedWebSearchResultText returns the decoded snippet text and whether
+// every result decoded. The error form (a single object) and any malformed or
+// forged token both report false so the caller emits an error tool_result.
+func decodeReplayedWebSearchResultText(content json.RawMessage) (string, bool) {
+	var entries []struct {
+		EncryptedContent string `json:"encrypted_content"`
+	}
+	if err := json.Unmarshal(content, &entries); err != nil || len(entries) == 0 {
+		return "web search result could not be decoded", false
+	}
+	decoded := make([]webSearchResult, 0, len(entries))
+	for _, entry := range entries {
+		result, ok := decodeWebSearchContent(entry.EncryptedContent)
+		if !ok {
+			return "web search result could not be decoded", false
+		}
+		decoded = append(decoded, result)
+	}
+	return webSearchResultsText(decoded), true
+}

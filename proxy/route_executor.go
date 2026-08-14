@@ -56,6 +56,10 @@ const (
 	routeAttemptFailover              routeAttemptKind = "route_failover"
 	routeAttemptCompaction            routeAttemptKind = "compaction"
 	routeAttemptCompatibilityFallback routeAttemptKind = "compatibility_fallback"
+	// routeAttemptWebSearch marks a proxy-mediated Anthropic web_search turn.
+	// These dispatches draw on remainingWebSearchSends so the client's own
+	// max_upstream_sends budget stays available for a passthrough fallback.
+	routeAttemptWebSearch routeAttemptKind = "web_search"
 )
 
 type routeRetryDecision string
@@ -203,6 +207,7 @@ type routeOperation struct {
 
 	remainingTargetAttempts int
 	remainingUpstreamSends  int
+	remainingWebSearchSends int
 	attemptedTargets        map[string]struct{}
 	pinnedTargetID          string
 	hardPinned              bool
@@ -466,7 +471,7 @@ func (o *routeOperation) allowsAutomaticTargetSwitch(kind routeAttemptKind) bool
 		return false
 	}
 	switch kind {
-	case routeAttemptProtocolRecovery, routeAttemptCompaction, routeAttemptCompatibilityFallback:
+	case routeAttemptProtocolRecovery, routeAttemptCompaction, routeAttemptCompatibilityFallback, routeAttemptWebSearch:
 		return false
 	default:
 		return true
@@ -496,6 +501,19 @@ func (o *routeOperation) reserveTarget(targetID string) (sequence int, switched 
 	return o.sequence, switched, true
 }
 
+// grantWebSearchSends raises the mediated web_search dispatch allowance. It is
+// idempotent and never lowers an allowance already granted for this operation.
+func (o *routeOperation) grantWebSearchSends(sends int) {
+	if o == nil || sends <= 0 {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if sends > o.remainingWebSearchSends {
+		o.remainingWebSearchSends = sends
+	}
+}
+
 func (o *routeOperation) reserveSendAtDispatch(ctx context.Context, shuttingDown bool) (bool, routeRetryDecision) {
 	if o == nil {
 		return true, routeRetryAccepted
@@ -510,6 +528,17 @@ func (o *routeOperation) reserveSendAtDispatch(ctx context.Context, shuttingDown
 	}
 	if o.inbound != nil && o.inbound.Err() != nil {
 		return false, routeRetrySuppressedAdmission
+	}
+	// Mediated web_search turns are proxy-originated, not client retries: they
+	// spend their own allowance so the client's max_upstream_sends stays whole
+	// for a passthrough fallback if mediation fails.
+	if routeAttemptKindFromContext(ctx) == routeAttemptWebSearch {
+		if o.remainingWebSearchSends <= 0 {
+			return false, routeRetrySuppressedBudget
+		}
+		o.remainingWebSearchSends--
+		o.upstreamSends++
+		return true, routeRetryAccepted
 	}
 	if o.remainingUpstreamSends <= 0 {
 		return false, routeRetrySuppressedBudget

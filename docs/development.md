@@ -402,6 +402,15 @@ You can also run the same smoke scripts locally after building `vekil`; the CLI 
 - Add config validation and tests for the new provider type.
 - See [`tool-optimizers.md`](tool-optimizers.md) for the config protocols (`rtk_cli`, `exec_json`, and `noop`).
 
+### Extend proxy-mediated web search
+
+- Keep mediation opt-in, Copilot-only on the direct `/v1/messages` path, and fail-open to passthrough with the original body.
+- Never fall back after `markExplicitRouteDownstreamCommitment`.
+- Mediated dispatches must keep their own attempt kind and send counter so the client's `max_upstream_sends` stays available for the fallback.
+- Decode replayed `encrypted_content` fail-closed to a `web_search_tool_result_error`; never pass malformed or forged content to the model.
+- Run `go test ./proxy/ -run 'TestRunWebSearchLoop|TestDecodeReplayedWebSearchBlocks|TestWriteAnthropicMessageAsSSE|TestHandleAnthropicMessagesWebSearch' -count=1` for the mediation suite.
+- See [`web-search.md`](web-search.md) for the config surface and defaults.
+
 ### Add or extend a provider type
 
 - Register the provider kind in `proxy/providers.go` and its endpoint policy in `proxy/provider_endpoint_policy.go`.
