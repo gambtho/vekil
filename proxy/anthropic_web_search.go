@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -197,4 +198,61 @@ func (h *ProxyHandler) webSearchDelegateModel(provider *providerRuntime) (provid
 		}
 	}
 	return providerModel{}, false
+}
+
+// anthropicWebSearchClientToolJSON is the degenerate client tool the upstream
+// sees in place of the hosted entry. It carries no filters: max_uses,
+// allowed_domains, blocked_domains and user_location are held proxy-side and
+// applied to the results instead.
+const anthropicWebSearchClientToolJSON = `{"name":"web_search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}`
+
+// rewriteAnthropicWebSearchRequest swaps the hosted tool for a plain client
+// tool and forces non-streaming, operating on the raw body so unknown
+// top-level and per-tool fields survive untouched. Key order within the object
+// is not preserved (encoding/json sorts map keys); field content is.
+func rewriteAnthropicWebSearchRequest(body []byte, m *webSearchMediation) ([]byte, error) {
+	if m == nil {
+		return nil, fmt.Errorf("web search mediation is required")
+	}
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, fmt.Errorf("decode messages request: %w", err)
+	}
+	rawTools, ok := request["tools"]
+	if !ok {
+		return nil, fmt.Errorf("messages request carries no tools")
+	}
+	var rawToolEntries []json.RawMessage
+	if err := json.Unmarshal(rawTools, &rawToolEntries); err != nil {
+		return nil, fmt.Errorf("decode tools: %w", err)
+	}
+	// Re-derive the index from the raw array with the same detector used at
+	// activation, so detection has exactly one implementation.
+	decodedTools := make([]models.AnthropicTool, len(rawToolEntries))
+	if err := json.Unmarshal(rawTools, &decodedTools); err != nil {
+		return nil, fmt.Errorf("decode tools: %w", err)
+	}
+	_, index, found := hostedWebSearchTool(decodedTools)
+	if !found || index < 0 || index >= len(rawToolEntries) {
+		return nil, fmt.Errorf("messages request carries no hosted %s tool", anthropicWebSearchToolName)
+	}
+
+	rewrittenTools := make([]json.RawMessage, len(rawToolEntries))
+	copy(rewrittenTools, rawToolEntries)
+	rewrittenTools[index] = json.RawMessage(anthropicWebSearchClientToolJSON)
+
+	encodedTools, err := json.Marshal(rewrittenTools)
+	if err != nil {
+		return nil, fmt.Errorf("encode tools: %w", err)
+	}
+	request["tools"] = encodedTools
+	// The client's own stream value is remembered by the caller for emission;
+	// upstream is always non-streaming so fallback stays available.
+	request["stream"] = json.RawMessage("false")
+
+	rewritten, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("encode messages request: %w", err)
+	}
+	return rewritten, nil
 }

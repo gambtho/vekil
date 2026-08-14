@@ -747,3 +747,83 @@ func TestHandleAnthropicCountTokensRejectsHostedWebFetchTool(t *testing.T) {
 		t.Fatalf("upstream calls: got=%d, want=0", upstreamCalls)
 	}
 }
+
+func TestRewriteAnthropicWebSearchRequestSwapsToolInPlace(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4.5","stream":true,"metadata":{"user_id":"u1"},"vekil_unknown_field":{"keep":"me"},` +
+		`"messages":[{"role":"user","content":"weather?"}],` +
+		`"tools":[{"name":"Bash","description":"run","input_schema":{"type":"object"}},` +
+		`{"type":"web_search_20250305","name":"web_search","max_uses":3,"allowed_domains":["example.com"],` +
+		`"blocked_domains":["spam.test"],"user_location":{"type":"approximate","city":"Seattle"}},` +
+		`{"name":"Read","input_schema":{"type":"object"}}]}`)
+
+	maxUses := 3
+	mediation := &webSearchMediation{
+		cfg:  webSearchTestEnabledConfig(),
+		tool: models.AnthropicTool{Type: "web_search_20250305", Name: "web_search", MaxUses: &maxUses},
+	}
+
+	rewritten, err := rewriteAnthropicWebSearchRequest(body, mediation)
+	if err != nil {
+		t.Fatalf("rewriteAnthropicWebSearchRequest() error = %v", err)
+	}
+
+	var decoded struct {
+		Stream  bool              `json:"stream"`
+		Unknown map[string]string `json:"vekil_unknown_field"`
+		Tools   []json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(rewritten, &decoded); err != nil {
+		t.Fatalf("rewritten body is not valid JSON: %v", err)
+	}
+	if decoded.Stream {
+		t.Fatal("rewritten body did not force stream=false")
+	}
+	if decoded.Unknown["keep"] != "me" {
+		t.Fatalf("unknown top-level field was dropped: %s", rewritten)
+	}
+	if len(decoded.Tools) != 3 {
+		t.Fatalf("len(tools) = %d, want 3", len(decoded.Tools))
+	}
+
+	var swapped map[string]any
+	if err := json.Unmarshal(decoded.Tools[1], &swapped); err != nil {
+		t.Fatalf("swapped tool is not valid JSON: %v", err)
+	}
+	if swapped["name"] != "web_search" {
+		t.Fatalf("swapped tool name = %#v, want web_search", swapped["name"])
+	}
+	for _, forbidden := range []string{"type", "max_uses", "allowed_domains", "blocked_domains", "user_location"} {
+		if _, present := swapped[forbidden]; present {
+			t.Fatalf("hosted field %q leaked upstream: %s", forbidden, decoded.Tools[1])
+		}
+	}
+	schema, ok := swapped["input_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("swapped tool has no input_schema object: %s", decoded.Tools[1])
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok || properties["query"] == nil {
+		t.Fatalf("swapped tool schema lacks a query property: %s", decoded.Tools[1])
+	}
+
+	var first map[string]any
+	if err := json.Unmarshal(decoded.Tools[0], &first); err != nil {
+		t.Fatalf("neighbor tool is not valid JSON: %v", err)
+	}
+	if first["name"] != "Bash" {
+		t.Fatalf("tool order changed: tools[0] = %s", decoded.Tools[0])
+	}
+}
+
+func TestRewriteAnthropicWebSearchRequestErrorsWithoutHostedTool(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-4.5","tools":[{"name":"Bash","input_schema":{"type":"object"}}]}`)
+	if _, err := rewriteAnthropicWebSearchRequest(body, &webSearchMediation{}); err == nil {
+		t.Fatal("rewriteAnthropicWebSearchRequest() succeeded on a body with no hosted tool")
+	}
+	if _, err := rewriteAnthropicWebSearchRequest([]byte(`{`), &webSearchMediation{}); err == nil {
+		t.Fatal("rewriteAnthropicWebSearchRequest() succeeded on malformed JSON")
+	}
+	if _, err := rewriteAnthropicWebSearchRequest([]byte(`{"model":"m"}`), nil); err == nil {
+		t.Fatal("rewriteAnthropicWebSearchRequest() succeeded with a nil mediation")
+	}
+}
