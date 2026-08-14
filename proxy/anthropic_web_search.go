@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"sort"
 	"strings"
 
 	"github.com/sozercan/vekil/models"
@@ -99,4 +100,101 @@ func translateAnthropicToolsForTokenCount(tools []models.AnthropicTool) ([]model
 		out[index] = webSearchStandInTool()
 	}
 	return out, substituted
+}
+
+// webSearchMediation is the resolved, immutable decision to mediate one
+// Anthropic /v1/messages turn. Everything the client asked for that must not
+// reach the upstream (max_uses and the domain/location filters) lives on tool
+// and is applied proxy-side instead.
+type webSearchMediation struct {
+	cfg         WebSearchConfig
+	tool        models.AnthropicTool
+	delegate    providerModel
+	provider    *providerRuntime
+	maxSearches int
+}
+
+// webSearchMediationFor decides whether this request is eligible for
+// proxy-mediated web search. Every miss is a silent decline: the caller keeps
+// today's byte-for-byte passthrough.
+func (h *ProxyHandler) webSearchMediationFor(req *models.AnthropicRequest) (*webSearchMediation, bool) {
+	if h == nil || req == nil || !h.webSearch.Enabled {
+		return nil, false
+	}
+	tool, _, ok := hostedWebSearchTool(req.Tools)
+	if !ok {
+		return nil, false
+	}
+	// A client tool of the same name would make the intercepted call ambiguous.
+	if clientDefinesWebSearchTool(req.Tools) {
+		return nil, false
+	}
+	provider, _, known := h.resolveProviderModelForRequest(req.Model, providerEndpointMessages)
+	// Hard exclusion, not an optimization: providerTypeAnthropicCompatible also
+	// takes the direct path and already serves hosted web_search natively.
+	// Mediating there would replace a working path with an approximation.
+	if provider == nil || !known || provider.kind != providerTypeCopilot {
+		return nil, false
+	}
+	delegate, ok := h.webSearchDelegateModel(provider)
+	if !ok {
+		return nil, false
+	}
+
+	maxSearches := h.webSearch.MaxSearches
+	if tool.MaxUses != nil && *tool.MaxUses < maxSearches {
+		maxSearches = *tool.MaxUses
+	}
+	if maxSearches <= 0 {
+		return nil, false
+	}
+	return &webSearchMediation{
+		cfg:         h.webSearch,
+		tool:        tool,
+		delegate:    delegate,
+		provider:    provider,
+		maxSearches: maxSearches,
+	}, true
+}
+
+// webSearchDelegateModel picks the model that runs the hosted search. It is
+// constrained to provider — a privacy boundary, not just a correctness one:
+// search queries must not leave the provider the client is already talking to.
+func (h *ProxyHandler) webSearchDelegateModel(provider *providerRuntime) (providerModel, bool) {
+	if h == nil || provider == nil {
+		return providerModel{}, false
+	}
+	candidates := h.providerSetup().modelsForProvider(provider.id)
+	// modelsForProvider walks a map, so order is not stable across calls.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].publicID < candidates[j].publicID })
+
+	if configured := strings.TrimSpace(h.webSearch.DelegateModel); configured != "" {
+		for _, candidate := range candidates {
+			if candidate.publicID != configured || candidate.disabled {
+				continue
+			}
+			// A pinned delegate must advertise /responses just like a discovered
+			// one. Without this check a Messages-only pin activates mediation and
+			// then fails every search, costing a wasted upstream call per turn
+			// with no error explaining why.
+			if !supportsEndpoint(candidate.supportedEndpoints, providerEndpointResponses) {
+				return providerModel{}, false
+			}
+			return candidate, true
+		}
+		// A configured delegate owned by another provider is a decline, never a
+		// cross-provider fallback.
+		return providerModel{}, false
+	}
+	for _, candidate := range candidates {
+		if candidate.disabled {
+			continue
+		}
+		// Explicit advertisement only: supportsEndpoint is false for an empty
+		// endpoint list, so unknown models are never guessed into delegation.
+		if supportsEndpoint(candidate.supportedEndpoints, providerEndpointResponses) {
+			return candidate, true
+		}
+	}
+	return providerModel{}, false
 }

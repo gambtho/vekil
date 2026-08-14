@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sozercan/vekil/auth"
+	"github.com/sozercan/vekil/logger"
 	"github.com/sozercan/vekil/models"
 )
 
@@ -428,6 +430,236 @@ func TestHandleAnthropicMessagesRejectsHostedWebSearchTool(t *testing.T) {
 	}
 	if upstreamCalls != 0 {
 		t.Fatalf("upstream calls: got=%d, want=0", upstreamCalls)
+	}
+}
+
+type webSearchTestCatalog struct {
+	provider *providerRuntime
+	models   []providerModel
+}
+
+func webSearchTestProvider(id string, kind providerType, baseURL string) *providerRuntime {
+	return &providerRuntime{
+		id:            id,
+		kind:          kind,
+		baseURL:       baseURL,
+		paths:         providerEndpointPolicyFor(kind).defaultEndpointPaths(),
+		includeModels: map[string]struct{}{},
+		excludeModels: map[string]struct{}{},
+		staticModels:  map[string]providerModel{},
+	}
+}
+
+func webSearchTestHandler(t *testing.T, cfg WebSearchConfig, entries ...webSearchTestCatalog) *ProxyHandler {
+	t.Helper()
+	setup := &providerSetup{
+		providers:          map[string]*providerRuntime{},
+		models:             map[string]providerModel{},
+		hasConfiguredState: true,
+	}
+	for _, entry := range entries {
+		setup.providers[entry.provider.id] = entry.provider
+		setup.providerOrder = append(setup.providerOrder, entry.provider.id)
+		if setup.defaultProviderID == "" {
+			setup.defaultProviderID = entry.provider.id
+		}
+	}
+	for _, entry := range entries {
+		if err := setup.addProviderModels(entry.provider.id, entry.models); err != nil {
+			t.Fatalf("addProviderModels(%q) error = %v", entry.provider.id, err)
+		}
+	}
+	h := &ProxyHandler{
+		auth:           auth.NewTestAuthenticator("test-token"),
+		client:         http.DefaultClient,
+		log:            logger.NewWithWriter(logger.LevelError, io.Discard),
+		providersState: setup,
+		webSearch:      cfg,
+	}
+	h.initializeLifecycle()
+	return h
+}
+
+func webSearchTestEnabledConfig() WebSearchConfig {
+	return WebSearchConfig{
+		Enabled:           true,
+		MaxSearches:       5,
+		TimeoutMS:         30000,
+		SearchContextSize: "low",
+		MaxResults:        10,
+	}
+}
+
+func webSearchTestHostedTool() models.AnthropicTool {
+	return models.AnthropicTool{Type: "web_search_20250305", Name: "web_search"}
+}
+
+func webSearchTestRequest(model string, tools ...models.AnthropicTool) *models.AnthropicRequest {
+	return &models.AnthropicRequest{
+		Model:    model,
+		Messages: []models.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+		Tools:    tools,
+	}
+}
+
+func TestWebSearchMediationForEngagesOnCopilotWithSameProviderDelegate(t *testing.T) {
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, "https://copilot.invalid")
+	h := webSearchTestHandler(t, webSearchTestEnabledConfig(), webSearchTestCatalog{
+		provider: copilot,
+		models: []providerModel{
+			{publicID: "claude-sonnet-4.5", upstreamModel: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "gpt-5.1", upstreamModel: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+		},
+	})
+
+	maxUses := 2
+	tool := webSearchTestHostedTool()
+	tool.MaxUses = &maxUses
+
+	mediation, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", tool))
+	if !ok {
+		t.Fatal("webSearchMediationFor() did not engage for a Copilot-owned model")
+	}
+	if mediation.provider == nil || mediation.provider.id != "copilot" {
+		t.Fatalf("mediation.provider = %#v, want copilot", mediation.provider)
+	}
+	if mediation.delegate.publicID != "gpt-5.1" {
+		t.Fatalf("mediation.delegate = %q, want gpt-5.1", mediation.delegate.publicID)
+	}
+	if mediation.maxSearches != 2 {
+		t.Fatalf("mediation.maxSearches = %d, want 2 (min of max_uses and max_searches)", mediation.maxSearches)
+	}
+}
+
+func TestWebSearchMediationForUsesConfigCeilingWhenMaxUsesOmitted(t *testing.T) {
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, "https://copilot.invalid")
+	h := webSearchTestHandler(t, webSearchTestEnabledConfig(), webSearchTestCatalog{
+		provider: copilot,
+		models: []providerModel{
+			{publicID: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+		},
+	})
+
+	mediation, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool()))
+	if !ok {
+		t.Fatal("webSearchMediationFor() did not engage without max_uses")
+	}
+	if mediation.maxSearches != 5 {
+		t.Fatalf("mediation.maxSearches = %d, want 5 (config max_searches alone)", mediation.maxSearches)
+	}
+}
+
+func TestWebSearchMediationForSkipsAnthropicCompatibleProvider(t *testing.T) {
+	native := webSearchTestProvider("anthropic", providerTypeAnthropicCompatible, "https://anthropic.invalid")
+	h := webSearchTestHandler(t, webSearchTestEnabledConfig(), webSearchTestCatalog{
+		provider: native,
+		models: []providerModel{
+			{publicID: "claude-sonnet-4.5", providerID: "anthropic", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "claude-responses", providerID: "anthropic", supportedEndpoints: []string{providerEndpointResponses}},
+		},
+	})
+
+	if _, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool())); ok {
+		t.Fatal("webSearchMediationFor() mediated an anthropic-compatible provider that already serves hosted web_search natively")
+	}
+}
+
+func TestWebSearchMediationForNeverSelectsDelegateOnAnotherProvider(t *testing.T) {
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, "https://copilot.invalid")
+	azure := webSearchTestProvider("azure", providerTypeAzureOpenAI, "https://azure.invalid")
+	h := webSearchTestHandler(t, webSearchTestEnabledConfig(),
+		webSearchTestCatalog{
+			provider: copilot,
+			models: []providerModel{
+				{publicID: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			},
+		},
+		webSearchTestCatalog{
+			provider: azure,
+			models: []providerModel{
+				{publicID: "gpt-5.4-pro", providerID: "azure", supportedEndpoints: []string{providerEndpointResponses}},
+			},
+		},
+	)
+
+	if mediation, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool())); ok {
+		t.Fatalf("webSearchMediationFor() engaged with cross-provider delegate %q on provider %q", mediation.delegate.publicID, mediation.delegate.providerID)
+	}
+}
+
+func TestWebSearchMediationForRejectsConfiguredDelegateOnAnotherProvider(t *testing.T) {
+	cfg := webSearchTestEnabledConfig()
+	cfg.DelegateModel = "gpt-5.4-pro"
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, "https://copilot.invalid")
+	azure := webSearchTestProvider("azure", providerTypeAzureOpenAI, "https://azure.invalid")
+	h := webSearchTestHandler(t, cfg,
+		webSearchTestCatalog{
+			provider: copilot,
+			models: []providerModel{
+				{publicID: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+				{publicID: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+			},
+		},
+		webSearchTestCatalog{
+			provider: azure,
+			models: []providerModel{
+				{publicID: "gpt-5.4-pro", providerID: "azure", supportedEndpoints: []string{providerEndpointResponses}},
+			},
+		},
+	)
+
+	if _, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool())); ok {
+		t.Fatal("webSearchMediationFor() honored a configured delegate owned by a different provider")
+	}
+}
+
+func TestWebSearchMediationForRejectsConfiguredDelegateWithoutResponses(t *testing.T) {
+	cfg := webSearchTestEnabledConfig()
+	cfg.DelegateModel = "claude-messages-only"
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, "https://copilot.invalid")
+	h := webSearchTestHandler(t, cfg, webSearchTestCatalog{
+		provider: copilot,
+		models: []providerModel{
+			{publicID: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "claude-messages-only", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+		},
+	})
+
+	// A pinned delegate that cannot serve /responses must decline outright rather
+	// than silently fall through to an auto-discovered one: honoring the pin
+	// would activate mediation and then fail every search, and falling through
+	// would ignore an explicit operator choice.
+	if _, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool())); ok {
+		t.Fatal("webSearchMediationFor() honored a configured delegate that does not advertise /responses")
+	}
+}
+
+func TestWebSearchMediationForDeclinesWhenDisabledOrAmbiguous(t *testing.T) {
+	catalog := func() webSearchTestCatalog {
+		return webSearchTestCatalog{
+			provider: webSearchTestProvider("copilot", providerTypeCopilot, "https://copilot.invalid"),
+			models: []providerModel{
+				{publicID: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+				{publicID: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+			},
+		}
+	}
+
+	disabledCfg := webSearchTestEnabledConfig()
+	disabledCfg.Enabled = false
+	if _, ok := webSearchTestHandler(t, disabledCfg, catalog()).webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool())); ok {
+		t.Fatal("webSearchMediationFor() engaged while disabled")
+	}
+
+	h := webSearchTestHandler(t, webSearchTestEnabledConfig(), catalog())
+	if _, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5")); ok {
+		t.Fatal("webSearchMediationFor() engaged without a hosted tool")
+	}
+	clientTool := models.AnthropicTool{Name: "web_search", InputSchema: json.RawMessage(`{"type":"object"}`)}
+	if _, ok := h.webSearchMediationFor(webSearchTestRequest("claude-sonnet-4.5", webSearchTestHostedTool(), clientTool)); ok {
+		t.Fatal("webSearchMediationFor() engaged while the client defines its own web_search tool")
 	}
 }
 
