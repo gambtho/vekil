@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -825,5 +826,196 @@ func TestRewriteAnthropicWebSearchRequestErrorsWithoutHostedTool(t *testing.T) {
 	}
 	if _, err := rewriteAnthropicWebSearchRequest([]byte(`{"model":"m"}`), nil); err == nil {
 		t.Fatal("rewriteAnthropicWebSearchRequest() succeeded with a nil mediation")
+	}
+}
+
+func TestDelegateWebSearchPinsRequestAndPostFiltersResults(t *testing.T) {
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != providerEndpointResponses {
+			t.Errorf("delegate path = %q, want %q", r.URL.Path, providerEndpointResponses)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read delegate body: %v", err)
+		}
+		captured = body
+		payload := `[{"url":"https://example.com/a","title":"A","snippet":"first","page_age":"2 days ago"},` +
+			`{"url":"https://spam.test/b","title":"B","snippet":"blocked","page_age":""},` +
+			`{"url":"https://example.com/c","title":"C","snippet":"third","page_age":""}]`
+		fenced, err := json.Marshal("```json\n" + payload + "\n```")
+		if err != nil {
+			t.Errorf("marshal delegate text: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-1","status":"completed","usage":{"input_tokens":140,"output_tokens":60,"total_tokens":200},`+
+			`"output":[{"type":"message","content":[{"type":"output_text","text":`+string(fenced)+`}]}]}`)
+	}))
+	defer upstream.Close()
+
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, upstream.URL)
+	h := webSearchTestHandler(t, webSearchTestEnabledConfig(), webSearchTestCatalog{
+		provider: copilot,
+		models: []providerModel{
+			{publicID: "claude-sonnet-4.5", providerID: "copilot", supportedEndpoints: []string{providerEndpointMessages}},
+			{publicID: "gpt-5.1", upstreamModel: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+		},
+	})
+
+	cfg := webSearchTestEnabledConfig()
+	cfg.MaxResults = 1
+	_, summary := WithRequestSummary(context.Background())
+	mediation := &webSearchMediation{
+		cfg:         cfg,
+		provider:    copilot,
+		delegate:    providerModel{publicID: "gpt-5.1", upstreamModel: "gpt-5.1", providerID: "copilot"},
+		maxSearches: 1,
+		summary:     summary,
+		tool: models.AnthropicTool{
+			Type:           "web_search_20250305",
+			Name:           "web_search",
+			AllowedDomains: []string{"example.com"},
+			BlockedDomains: []string{"spam.test"},
+			UserLocation:   json.RawMessage(`{"type":"approximate","city":"Seattle"}`),
+		},
+	}
+
+	results, err := h.delegateWebSearch(context.Background(), mediation, "seattle weather")
+	if err != nil {
+		t.Fatalf("delegateWebSearch() error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1 after blocked-domain filtering and max_results truncation: %#v", len(results), results)
+	}
+	if results[0].URL != "https://example.com/a" || results[0].PageAge != "2 days ago" {
+		t.Fatalf("results[0] = %#v", results[0])
+	}
+
+	// Delegated spend is accumulated on the mediation, not booked to the turn.
+	if mediation.delegatedUsage.InputTokens != 140 || mediation.delegatedUsage.OutputTokens != 60 {
+		t.Fatalf("delegatedUsage after one call = %#v, want 140/60", mediation.delegatedUsage)
+	}
+	if _, err := h.delegateWebSearch(context.Background(), mediation, "seattle weather again"); err != nil {
+		t.Fatalf("second delegateWebSearch() error = %v", err)
+	}
+	if mediation.delegatedUsage.InputTokens != 280 || mediation.delegatedUsage.OutputTokens != 120 {
+		t.Fatalf("delegatedUsage is not additive across calls: %#v", mediation.delegatedUsage)
+	}
+	if got := summary.UpstreamSendCount(); got != 2 {
+		t.Fatalf("summary.UpstreamSendCount() = %d, want 2 (one per delegated dispatch)", got)
+	}
+
+	var request struct {
+		Model     string `json:"model"`
+		Stream    bool   `json:"stream"`
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+		Tools []struct {
+			Type              string `json:"type"`
+			SearchContextSize string `json:"search_context_size"`
+			Filters           struct {
+				AllowedDomains []string `json:"allowed_domains"`
+				BlockedDomains []string `json:"blocked_domains"`
+			} `json:"filters"`
+			UserLocation json.RawMessage `json:"user_location"`
+		} `json:"tools"`
+		Input []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(captured, &request); err != nil {
+		t.Fatalf("delegate request is not valid JSON: %v", err)
+	}
+	if request.Model != "gpt-5.1" || request.Stream {
+		t.Fatalf("delegate request model/stream = %q/%v", request.Model, request.Stream)
+	}
+	if request.Reasoning.Effort != "low" {
+		t.Fatalf("reasoning.effort = %q, want low", request.Reasoning.Effort)
+	}
+	if len(request.Tools) != 1 || request.Tools[0].Type != "web_search" {
+		t.Fatalf("delegate tools = %#v", request.Tools)
+	}
+	if request.Tools[0].SearchContextSize != "low" {
+		t.Fatalf("search_context_size = %q, want low", request.Tools[0].SearchContextSize)
+	}
+	if len(request.Tools[0].Filters.AllowedDomains) != 1 || request.Tools[0].Filters.AllowedDomains[0] != "example.com" {
+		t.Fatalf("filters.allowed_domains = %#v", request.Tools[0].Filters.AllowedDomains)
+	}
+	if len(request.Tools[0].Filters.BlockedDomains) != 1 || request.Tools[0].Filters.BlockedDomains[0] != "spam.test" {
+		t.Fatalf("filters.blocked_domains = %#v", request.Tools[0].Filters.BlockedDomains)
+	}
+	if !strings.Contains(string(request.Tools[0].UserLocation), "Seattle") {
+		t.Fatalf("user_location = %s", request.Tools[0].UserLocation)
+	}
+	if len(request.Input) != 2 || request.Input[0].Role != "developer" {
+		t.Fatalf("delegate input = %#v", request.Input)
+	}
+}
+
+func TestDelegateWebSearchFailsOnUpstreamErrorAndInvalidJSON(t *testing.T) {
+	mode := "error"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if mode == "error" {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"nope"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp-2","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"I could not find anything."}]}]}`)
+	}))
+	defer upstream.Close()
+
+	copilot := webSearchTestProvider("copilot", providerTypeCopilot, upstream.URL)
+	h := webSearchTestHandler(t, webSearchTestEnabledConfig(), webSearchTestCatalog{
+		provider: copilot,
+		models: []providerModel{
+			{publicID: "gpt-5.1", upstreamModel: "gpt-5.1", providerID: "copilot", supportedEndpoints: []string{providerEndpointResponses}},
+		},
+	})
+	mediation := &webSearchMediation{
+		cfg:      webSearchTestEnabledConfig(),
+		provider: copilot,
+		delegate: providerModel{publicID: "gpt-5.1", upstreamModel: "gpt-5.1", providerID: "copilot"},
+		tool:     webSearchTestHostedTool(),
+	}
+
+	// A nil summary must not panic: delegation is also reachable from paths
+	// that have no request summary attached.
+	if _, err := h.delegateWebSearch(context.Background(), mediation, "q"); err == nil {
+		t.Fatal("delegateWebSearch() succeeded on a non-200 upstream response")
+	}
+	mode = "prose"
+	if _, err := h.delegateWebSearch(context.Background(), mediation, "q"); err == nil {
+		t.Fatal("delegateWebSearch() succeeded on non-JSON delegate output")
+	}
+}
+
+func TestFilterWebSearchResultsIsAuthoritative(t *testing.T) {
+	results := []webSearchResult{
+		{URL: "https://docs.example.com/x", Title: "sub"},
+		{URL: "https://spam.test/y", Title: "blocked"},
+		{URL: "https://evil.example.org/z", Title: "not allowed"},
+		{URL: "not a url", Title: "unparseable"},
+		{URL: "https://example.com/w", Title: "allowed"},
+	}
+	tool := models.AnthropicTool{
+		AllowedDomains: []string{"example.com"},
+		BlockedDomains: []string{"spam.test"},
+	}
+
+	filtered := filterWebSearchResults(results, tool, 10)
+	if len(filtered) != 2 {
+		t.Fatalf("len(filtered) = %d, want 2: %#v", len(filtered), filtered)
+	}
+	if filtered[0].URL != "https://docs.example.com/x" || filtered[1].URL != "https://example.com/w" {
+		t.Fatalf("filtered = %#v", filtered)
+	}
+	if truncated := filterWebSearchResults(results, tool, 1); len(truncated) != 1 {
+		t.Fatalf("len(truncated) = %d, want 1", len(truncated))
+	}
+	if unbounded := filterWebSearchResults(results, models.AnthropicTool{}, 3); len(unbounded) != 3 {
+		t.Fatalf("len(unbounded) = %d, want 3 with no filters and max_results=3", len(unbounded))
 	}
 }

@@ -1,10 +1,15 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sozercan/vekil/models"
 )
@@ -113,6 +118,12 @@ type webSearchMediation struct {
 	delegate    providerModel
 	provider    *providerRuntime
 	maxSearches int
+	// summary counts physical dispatches so upstream_sends stays honest;
+	// singleInferenceSend bypasses the route executor's RecordUpstreamAttempt.
+	summary *RequestSummary
+	// delegatedUsage accumulates internal Responses spend across the turn so
+	// Task 12 can flush it additively instead of clobbering the turn's usage.
+	delegatedUsage responsesUsage
 }
 
 // webSearchMediationFor decides whether this request is eligible for
@@ -255,4 +266,239 @@ func rewriteAnthropicWebSearchRequest(body []byte, m *webSearchMediation) ([]byt
 		return nil, fmt.Errorf("encode messages request: %w", err)
 	}
 	return rewritten, nil
+}
+
+// webSearchMaxResponseBytes bounds a delegated /responses body, mirroring the
+// policy classifier's policyClassifierResponseLimit (proxy/policy_routing.go:18)
+// while staying independently tunable.
+const webSearchMaxResponseBytes = 64 << 10
+
+// webSearchDelegateInstruction is load-bearing, not decoration: without the
+// single-search and no-refinement constraints one delegated call fans out to a
+// dozen internal searches and latency roughly quadruples.
+const webSearchDelegateInstruction = "You are a search executor, not an assistant. " +
+	"Run exactly ONE web search for the user's query. Do not refine, retry, or run additional searches. " +
+	"Reply with ONLY a JSON array of objects with the keys \"url\", \"title\", \"snippet\" and \"page_age\". " +
+	"Use an empty string for any field you do not know. " +
+	"No prose, no explanation, no markdown fences, no other keys."
+
+// webSearchResult is one post-filtered search hit.
+type webSearchResult struct {
+	URL     string `json:"url"`
+	Title   string `json:"title"`
+	Snippet string `json:"snippet"`
+	PageAge string `json:"page_age"`
+}
+
+// delegateWebSearch performs one internal /responses call on the same provider
+// that owns the conversation. It dispatches through singleInferenceSend so a
+// delegation failure cannot consume the client's route failover budget. Any
+// error means the caller falls back to plain passthrough.
+func (h *ProxyHandler) delegateWebSearch(ctx context.Context, m *webSearchMediation, query string) ([]webSearchResult, error) {
+	if h == nil || m == nil || m.provider == nil {
+		return nil, fmt.Errorf("web search delegation requires a resolved mediation")
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("web search query is empty")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.cfg.TimeoutMS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(m.cfg.TimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
+
+	body, err := buildWebSearchDelegateRequest(m, query)
+	if err != nil {
+		return nil, err
+	}
+	req, err := h.newProviderJSONRequest(ctx, m.provider, http.MethodPost, providerEndpointResponses, body, http.Header{"Content-Type": []string{"application/json"}}, "", m.delegate)
+	if err != nil {
+		return nil, fmt.Errorf("build web search delegate request: %w", err)
+	}
+	resp, err := h.singleInferenceSend(req, newRouteSendObservation(time.Now(), nil))
+	if err != nil {
+		return nil, fmt.Errorf("web search delegate send: %w", err)
+	}
+	// This dispatch never passes through the route executor, so nothing else
+	// counts it. Record it here, immediately: singleInferenceSend has already
+	// performed the HTTP request by the time it returns a response, and the
+	// counter represents physical sends. Recording it further down would drop
+	// non-200s, oversized bodies and read failures from upstream_sends —
+	// precisely the traffic someone debugging this would be looking for.
+	m.summary.RecordUpstreamSend()
+	defer drainAndClose(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("web search delegate returned HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, webSearchMaxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read web search delegate response: %w", err)
+	}
+	if len(raw) > webSearchMaxResponseBytes {
+		return nil, fmt.Errorf("web search delegate response exceeds %d bytes", webSearchMaxResponseBytes)
+	}
+
+	m.delegatedUsage.add(parseWebSearchDelegateUsage(raw))
+
+	results, err := parseWebSearchResults(webSearchDelegateOutputText(raw))
+	if err != nil {
+		return nil, err
+	}
+	// Post-filtering is authoritative regardless of the filters sent upstream:
+	// blocked_domains enforcement on the delegated side is unverified.
+	return filterWebSearchResults(results, m.tool, m.cfg.MaxResults), nil
+}
+
+func parseWebSearchDelegateUsage(body []byte) responsesUsage {
+	var envelope struct {
+		Usage responsesUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return responsesUsage{}
+	}
+	return envelope.Usage
+}
+
+func buildWebSearchDelegateRequest(m *webSearchMediation, query string) ([]byte, error) {
+	upstreamModel := strings.TrimSpace(m.delegate.upstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = strings.TrimSpace(m.delegate.publicID)
+	}
+	if upstreamModel == "" {
+		return nil, fmt.Errorf("web search delegate has no upstream model")
+	}
+
+	tool := map[string]any{"type": anthropicWebSearchToolName}
+	if size := strings.TrimSpace(m.cfg.SearchContextSize); size != "" {
+		tool["search_context_size"] = size
+	}
+	filters := map[string]any{}
+	if len(m.tool.AllowedDomains) > 0 {
+		filters["allowed_domains"] = m.tool.AllowedDomains
+	}
+	if len(m.tool.BlockedDomains) > 0 {
+		filters["blocked_domains"] = m.tool.BlockedDomains
+	}
+	if len(filters) > 0 {
+		tool["filters"] = filters
+	}
+	if len(m.tool.UserLocation) > 0 {
+		tool["user_location"] = m.tool.UserLocation
+	}
+
+	request := map[string]any{
+		"model":     upstreamModel,
+		"stream":    false,
+		"store":     false,
+		"reasoning": map[string]any{"effort": "low"},
+		"tools":     []any{tool},
+		"input": []any{
+			map[string]any{"role": "developer", "content": webSearchDelegateInstruction},
+			map[string]any{"role": "user", "content": query},
+		},
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("encode web search delegate request: %w", err)
+	}
+	return encoded, nil
+}
+
+func webSearchDelegateOutputText(body []byte) string {
+	var envelope struct {
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return ""
+	}
+	if strings.TrimSpace(envelope.OutputText) != "" {
+		return envelope.OutputText
+	}
+	var text strings.Builder
+	for _, item := range envelope.Output {
+		for _, part := range item.Content {
+			if part.Type == "output_text" {
+				text.WriteString(part.Text)
+			}
+		}
+	}
+	return text.String()
+}
+
+func parseWebSearchResults(text string) ([]webSearchResult, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil, fmt.Errorf("web search delegate returned no output text")
+	}
+	// Tolerate a fenced block even though the prompt forbids it.
+	if strings.HasPrefix(trimmed, "```") {
+		trimmed = strings.TrimPrefix(trimmed, "```")
+		trimmed = strings.TrimPrefix(trimmed, "json")
+		if end := strings.LastIndex(trimmed, "```"); end >= 0 {
+			trimmed = trimmed[:end]
+		}
+		trimmed = strings.TrimSpace(trimmed)
+	}
+	var results []webSearchResult
+	if err := json.Unmarshal([]byte(trimmed), &results); err != nil {
+		return nil, fmt.Errorf("web search delegate output is not a JSON result array: %w", err)
+	}
+	return results, nil
+}
+
+// filterWebSearchResults enforces the client's domain filters proxy-side and
+// truncates to maxResults. It is the authoritative filter regardless of what
+// was sent upstream.
+func filterWebSearchResults(results []webSearchResult, tool models.AnthropicTool, maxResults int) []webSearchResult {
+	filtered := make([]webSearchResult, 0, len(results))
+	for _, result := range results {
+		host := webSearchResultHost(result.URL)
+		if host == "" {
+			continue
+		}
+		if webSearchHostMatchesAny(host, tool.BlockedDomains) {
+			continue
+		}
+		if len(tool.AllowedDomains) > 0 && !webSearchHostMatchesAny(host, tool.AllowedDomains) {
+			continue
+		}
+		filtered = append(filtered, result)
+		if maxResults > 0 && len(filtered) >= maxResults {
+			break
+		}
+	}
+	return filtered
+}
+
+func webSearchResultHost(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" {
+		return ""
+	}
+	return strings.ToLower(parsed.Hostname())
+}
+
+func webSearchHostMatchesAny(host string, domains []string) bool {
+	for _, domain := range domains {
+		candidate := strings.ToLower(strings.TrimSpace(domain))
+		candidate = strings.TrimPrefix(candidate, "*.")
+		candidate = strings.TrimPrefix(candidate, ".")
+		if candidate == "" {
+			continue
+		}
+		if host == candidate || strings.HasSuffix(host, "."+candidate) {
+			return true
+		}
+	}
+	return false
 }
